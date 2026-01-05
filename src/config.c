@@ -6,14 +6,17 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <stdio.h>
 
 #include "config.h"
+
 // Priority: CONFIG SET > CLI > файл > defaults
 
 typedef struct {
@@ -47,6 +50,25 @@ static void config_free_str(char *str) {
   }
 }
 
+static char *config_asprintf(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  int len = vsnprintf(NULL, 0, format, args);
+  va_end(args);
+
+  if (len <= 0) return NULL;
+
+  char *buf = mmap(NULL, len + 1, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (buf == MAP_FAILED) return NULL;
+
+  va_start(args, format);
+  vsnprintf(buf, len + 1, format, args);
+  va_end(args);
+
+  return buf;
+}
+
 static void config_set_defaults(void) {
   config.port = DEFAULT_PORT;
   config.default_user = config_strdup(DEFAULT_USER);
@@ -62,7 +84,7 @@ static bool parse_int(const char *str, int *out) {
   if (!str) return false;
   char *end;
   errno = 0;
-  long val = strtol(str, &end, 10);
+  long val = strtol(str, &end, RADIX);
   if (errno || *end != '\0' || val < 0 || val > INT_MAX) return false;
   *out = (int)val;
   return true;
@@ -72,7 +94,7 @@ static bool parse_size_t(const char *str, size_t *out) {
   if (!str) return false;
   char *end;
   errno = 0;
-  unsigned long long val = strtoull(str, &end, 10);
+  unsigned long long val = strtoull(str, &end, RADIX);
   if (errno || *end != '\0') return false;
   *out = (size_t)val;
   return true;
@@ -103,11 +125,6 @@ static bool handle_verbose(const char *value) {
   return true;
 }
 
-static bool handle_config(const char *value) {
-  (void)value;
-  return true;
-}
-
 static void print_help_and_exit() {
   printf(
       "Usage: repa [OPTIONS]\n"
@@ -129,63 +146,33 @@ static bool handle_help(const char *value) {
   return true;
 }
 
-typedef struct {
-  const char *name;
-  bool takes_value;
-  bool (*handler)(const char *value);
-} flag_desc_t;
-
-static const flag_desc_t FLAGS[] = {
-    {"--port", true, handle_port},
-    {"--max-memory-mb", true, handle_max_memory_mb},
-    {"--workers", true, handle_workers},
-    {"--default-ttl", true, handle_default_ttl},
-    {"--verbose", false, handle_verbose},
-    {"--config", true, handle_config},
-    {"--help", false, handle_help},
-    {"--h", false, handle_help},
-    {NULL, false, NULL}};
-
-static void config_parse_cli(int argc, char *argv[], const char **config_path) {
-  *config_path = DEFAULT_CONFIG_PATH;
-
+static const char *get_config_path_from_cli(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
-    const char *arg = argv[i];
-    const flag_desc_t *found = NULL;
-
-    for (int j = 0; FLAGS[j].name; j++) {
-      if (strcmp(arg, FLAGS[j].name) == 0) {
-        found = &FLAGS[j];
-        break;
-      }
+    if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+      return argv[++i];
     }
+  }
+  return DEFAULT_CONFIG_PATH;
+}
 
-    if (!found) {
-      logger_warn("Unknown option: '%s'", arg);
-      exit(1);
-    }
-
-    const char *value = NULL;
-    if (found->takes_value) {
-      if (i + 1 >= argc) {
-        logger_warn("Option requires a value: '%s'", arg);
-        exit(1);
-      }
-      value = argv[++i];
-    }
-
-    if (!found->handler(value)) {
-      logger_warn("Invalid value for option: '%s'", arg);
-      exit(1);
-    }
-
-    if (strcmp(arg, "--config") == 0) {
-      *config_path = value;
+static void apply_cli_flags(int argc, char *argv[]) {
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      handle_port(argv[++i]);
+    } else if (strcmp(argv[i], "--max-memory-mb") == 0 && i + 1 < argc) {
+      handle_max_memory_mb(argv[++i]);
+    } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+      handle_workers(argv[++i]);
+    } else if (strcmp(argv[i], "--default-ttl") == 0 && i + 1 < argc) {
+      handle_default_ttl(argv[++i]);
+    } else if (strcmp(argv[i], "--verbose") == 0) {
+      handle_verbose(NULL);
+    } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "--h") == 0) {
+      handle_help(NULL);
     }
   }
 }
 
-// parse config file
 static bool config_load_file(const char *path) {
   int fd = open(path, O_RDONLY);
   if (fd == -1) {
@@ -245,7 +232,8 @@ static bool config_load_file(const char *path) {
     key[key_len] = '\0';
 
     char *val_start = eq + 1;
-    while (val_start < end_of_line && isspace((unsigned char)*val_start)) val_start++;
+    while (val_start < end_of_line && isspace((unsigned char)*val_start))
+      val_start++;
     char *val_end = end_of_line;
     while (val_end > val_start && isspace((unsigned char)val_end[-1]))
       val_end--;
@@ -302,10 +290,9 @@ void config_init(int argc, char *argv[]) {
   pthread_mutex_lock(&config.mutex);
   if (!config.is_init) {
     config_set_defaults();
-
-    const char *config_path = DEFAULT_CONFIG_PATH;
-    config_parse_cli(argc, argv, &config_path);
+    const char *config_path = get_config_path_from_cli(argc, argv);
     config_load_file(config_path);
+    apply_cli_flags(argc, argv);
 
     config.is_init = true;
   }
@@ -355,9 +342,7 @@ bool config_set(const char *param, const char *value) {
 }
 
 // Getters
-int config_get_port() {
-  return config.port;
-}
+int config_get_port() { return config.port; }
 
 char *config_get_param(const char *param) {
   if (!param) return NULL;
@@ -372,7 +357,7 @@ char *config_get_param(const char *param) {
   char *result = NULL;
 
   if (strcasecmp(param, "maxmemory") == 0) {
-    asprintf(&result, "%zu", config.max_memory_size_bytes);
+    result = config_asprintf("%zu", config.max_memory_size_bytes);
   } else if (strcasecmp(param, "loglevel") == 0) {
     if (config.log_level == DEBUG) {
       result = config_strdup("debug");
@@ -389,52 +374,42 @@ char *config_get_param(const char *param) {
     } else {
       result = config_strdup("");
     }
-  }
-  else if (strcasecmp(param, "port") == 0) {
-    asprintf(&result, "%d", config.port);
+  } else if (strcasecmp(param, "port") == 0) {
+    result = config_asprintf("%d", config.port);
   } else if (strcasecmp(param, "maxmemory-policy") == 0) {
-    result = config_strdup("noeviction"); 
+    result = config_strdup("noeviction");
   } else if (strcasecmp(param, "tcp-keepalive") == 0) {
     result = config_strdup("0");
   }
 
   pthread_mutex_unlock(&config.mutex);
-
-  if (result && strchr(result, '0') != result) {
-    if (config.is_init) {
-      char *mmap_result = config_strdup(result);
-      free(result);  
-      return mmap_result;
-    }
-  }
-
   return result;
 }
 
-size_t config_get_max_memory_bytes() {
-  return config.max_memory_size_bytes;
+size_t config_get_max_memory_bytes() { 
+  return config.max_memory_size_bytes; 
 }
 
-int config_get_default_ttl_sec() {
-  return config.default_ttl_sec;
+int config_get_default_ttl_sec() { 
+  return config.default_ttl_sec; 
 }
 
-int config_get_workers() {
-  return config.num_workers;
+int config_get_workers() { 
+  return config.num_workers; 
 }
 
-logger_level config_get_log_level() {
-  return config.log_level;
+logger_level config_get_log_level() { 
+  return config.log_level; 
 }
 
-char* config_get_log_output() {
-  return config.log_output;
+char *config_get_log_output() { 
+  return config.log_output; 
 }
 
-char *config_get_default_user() {
-  return config.default_user;
+char *config_get_default_user() { 
+  return config.default_user; 
 }
 
-char *config_get_default_password() {
-  return config.default_password;
+char *config_get_default_password() { 
+  return config.default_password; 
 }

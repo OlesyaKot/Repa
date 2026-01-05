@@ -17,6 +17,7 @@
 #define DEFAULT_NUM_WORKERS 4
 #define DEFAULT_LOG_LEVEL INFO
 #define DEFAULT_CONFIG_PATH "repa.conf"
+#define RADIX 10
 
 void config_init(int argc, char *argv[]);
 void config_destroy();

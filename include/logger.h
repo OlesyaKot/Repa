@@ -4,6 +4,7 @@
 #define LOG_BUFFER_SIZE 1024
 #define LEN_TIME 32
 #define MSEC_IN_NSEC 1000000
+#define PERMISSIONS 0644
 
 typedef enum {
   DEBUG,

@@ -11,6 +11,7 @@
 #define INPUT_BUFFER_INITIAL_SIZE (4 * 1024)
 #define MAX_INPUT_BUFFER_SIZE (8 * 1024 * 1024)
 #define ERROR_BUF_LEN 256
+#define MAX_WAIT_SEC 10
 
 bool server_start(const int port, const size_t worker_count);
 void server_stop();

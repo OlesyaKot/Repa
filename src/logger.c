@@ -32,7 +32,7 @@ void logger_init(const logger_level level, const char *logger_file) {
 
   logger_stat.level = level;
   if (logger_file && logger_file[0] != '\0') {
-    int fd = open(logger_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = open(logger_file, O_WRONLY | O_CREAT | O_APPEND, PERMISSIONS);
     if (fd == -1) {
       // error - use stderr
       logger_stat.fd = STDERR_FILENO;

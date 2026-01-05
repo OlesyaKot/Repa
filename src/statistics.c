@@ -209,7 +209,7 @@ char* stats_get_report() {
       "  hit_ratio                     %14.1f%%\n"
       "\n"
       "3. Memory\n"
-      "  used_memory_bytes        %14s  (0.0 / 0.0 MiB,  %14s)\n"  // временно
+      "  used_memory_bytes        %14s  (0.0 / 0.0 MiB,  %14s)\n"  
       "\n"
       "4. Connections / Uptime\n"
       "  current_connections           %14s\n"

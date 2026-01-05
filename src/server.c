@@ -26,6 +26,7 @@ typedef struct {
   char *input_buffer;
   size_t input_len;
   size_t input_capacity;
+  bool should_close;
   pthread_mutex_t mutex;
 } client_session;
 
@@ -42,6 +43,7 @@ typedef struct {
   pthread_t *workers;
   size_t worker_count;
   bool running;
+  bool shutting_down;
   pthread_mutex_t sessions_mutex;
   pthread_mutex_t listen_mutex;
 } server_state;
@@ -126,6 +128,7 @@ static void handle_command(client_session* session, resp_command* cmd) {
   if (strcmp(cmd_upper, "QUIT") == 0) {
     munmap(cmd_upper, cmd->command_len + 1);
     send_response(session->fd, resp_serialize_simple_string("OK"));
+    session->should_close = true; 
     return;
   }
 
@@ -147,7 +150,19 @@ static void handle_command(client_session* session, resp_command* cmd) {
 
   if (strcmp(cmd_upper, "AUTH") == 0) {
     munmap(cmd_upper, cmd->command_len + 1);
-    if (cmd->args_num >= 2) {
+
+    if (cmd->args_num == 1) {
+      // AUTH <password> - old format Redis (without username)
+      if (authorize_check_auth("admin", cmd->args[0])) {
+        session->is_auth = true;
+        send_response(session->fd, resp_serialize_simple_string("OK"));
+        stats_inc_cmd_other();
+      } else {
+        send_response(session->fd,
+                      resp_serialize_error("ERR invalid password"));
+      }
+    } else if (cmd->args_num == 2) {
+      // AUTH <username> <password> - new format
       if (authorize_check_auth(cmd->args[0], cmd->args[1])) {
         session->is_auth = true;
         send_response(session->fd, resp_serialize_simple_string("OK"));
@@ -156,8 +171,7 @@ static void handle_command(client_session* session, resp_command* cmd) {
         send_response(session->fd, resp_serialize_error("ERR invalid username-password pair"));
       }
     } else {
-      send_response(session->fd, 
-        resp_serialize_error("ERR wrong number of arguments for 'AUTH' command"));
+      send_response(session->fd, resp_serialize_error("ERR wrong number of arguments for 'AUTH' command"));
     }
     return;
   }
@@ -178,8 +192,7 @@ static void handle_command(client_session* session, resp_command* cmd) {
         stats_inc_miss();
       }
     } else {
-      send_response(session->fd,
-                    resp_serialize_error("ERR wrong number of arguments for 'GET' command"));
+      send_response(session->fd, resp_serialize_error("ERR wrong number of arguments for 'GET' command"));
     }
     return;
   }
@@ -273,7 +286,7 @@ static void handle_command(client_session* session, resp_command* cmd) {
           size_t value_len = strlen(value);
           send_response(session->fd,
                         resp_serialize_bulk_string(value, value_len));
-          munmap(value, value_len + 1);  
+          munmap(value, strlen(value) + 1);  
           stats_inc_cmd_other();
         } else {
           send_response(session->fd, resp_serialize_nil());
@@ -282,6 +295,9 @@ static void handle_command(client_session* session, resp_command* cmd) {
       } else if (strcasecmp(cmd->args[0], "SET") == 0) {
         if (cmd->args_num >= 3) {
           if (config_set(cmd->args[1], cmd->args[2])) {
+            if (strcasecmp(cmd->args[1], "requirepass") == 0) {
+              authorize_set_password(cmd->args[2]);
+            }
             send_response(session->fd, resp_serialize_simple_string("OK"));
             stats_inc_cmd_other();
           } else {
@@ -349,8 +365,9 @@ static void* worker_thread_func(void* args) {
 
           char read_buf[CLIENT_BUFFER_SIZE];
           ssize_t bytes_read = read(session->fd, read_buf, CLIENT_BUFFER_SIZE);
-
           if (bytes_read > 0) {
+            logger_debug("Received %zd bytes: '%.*s'", bytes_read,
+                         (int)bytes_read, read_buf);
             if (!expand_input_buf(session, session->input_len + bytes_read)) {
               logger_error("Input buffer too large, closing connection");
               free_session(session);
@@ -372,9 +389,10 @@ static void* worker_thread_func(void* args) {
               resp_free_command_list(cmds);
 
               // delete finished data
-              if (consumed > 0) {
-                memmove(session->input_buffer, session->input_buffer + consumed,
-                        session->input_len - consumed);
+              if (session->should_close) {
+                free_session(session);
+              } else if (consumed > 0) {
+                memmove(session->input_buffer, session->input_buffer + consumed, session->input_len - consumed);
                 session->input_len -= consumed;
               }
             } else if (consumed == 0 && session->input_len >= MAX_INPUT_BUFFER_SIZE) {
@@ -382,7 +400,7 @@ static void* worker_thread_func(void* args) {
               free_session(session);
             }
           } else if (bytes_read == 0) {
-            // client close connection
+            logger_debug("Client closed connection");
             free_session(session);
           } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -408,25 +426,22 @@ static void* worker_thread_func(void* args) {
   return NULL;
 }
 
-static void* accept_thread_func(void* args)  {
+static void *accept_thread_func(void *args) {
   (void)args;
   logger_info("Accept thread started");
 
-  while (server.running) {
+  while (server.running && !server.shutting_down) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
     pthread_mutex_lock(&server.listen_mutex);
-    int client_fd = accept(server.listen_fd, (struct sockaddr *)&client_addr,
-                           &client_len);
+    int client_fd = -1;
+    if (server.listen_fd >= 0) {
+      client_fd = accept(server.listen_fd, (struct sockaddr *)&client_addr, &client_len);
+    }
     pthread_mutex_unlock(&server.listen_mutex);
-  
-    if (client_fd >= 0) {
-      if (!server.running){
-        close(client_fd);
-        break;
-      }
 
+    if (client_fd >= 0) {
       int flags = fcntl(client_fd, F_GETFL, 0);
       fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -434,8 +449,8 @@ static void* accept_thread_func(void* args)  {
       pthread_mutex_lock(&server.sessions_mutex);
 
       if (server.sessions_count >= server.sessions_capacity) {
-        size_t new_capacity =
-            server.sessions_capacity ? server.sessions_capacity * 2 : DEFAULT_SESSION_CAP;
+        size_t new_capacity = server.sessions_capacity
+                                  ? server.sessions_capacity * 2 : DEFAULT_SESSION_CAP;
         client_session *new_sessions = mmap(NULL, new_capacity * sizeof(client_session),
                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (new_sessions == MAP_FAILED) {
@@ -459,6 +474,7 @@ static void* accept_thread_func(void* args)  {
       session->input_buffer = NULL;
       session->input_len = 0;
       session->input_capacity = 0;
+      session->should_close = false;
       pthread_mutex_init(&session->mutex, NULL);
       server.sessions_count++;
 
@@ -468,7 +484,11 @@ static void* accept_thread_func(void* args)  {
 
       pthread_mutex_unlock(&server.sessions_mutex);
     } else {
-      logger_error("Accept error");
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      } else if (errno != EINTR) {
+        logger_error("Accept error: %s", strerror(errno));
+      }
     }
   }
 
@@ -504,6 +524,9 @@ bool server_start(const int port, const size_t worker_count) {
     close(server.listen_fd);
     return false;
   }
+
+  int flags = fcntl(server.listen_fd, F_GETFL, 0);
+  fcntl(server.listen_fd, F_SETFL, flags | O_NONBLOCK);
 
   server.running = true;
   server.worker_count = worker_count;
@@ -555,7 +578,7 @@ bool server_start(const int port, const size_t worker_count) {
 }
 
 void server_stop() {
-  server.running = false;
+  logger_info("Initiating graceful shutdown...");
 
   pthread_mutex_lock(&server.listen_mutex);
   if (server.listen_fd >= 0) {
@@ -564,6 +587,28 @@ void server_stop() {
   }
   pthread_mutex_unlock(&server.listen_mutex);
 
+  server.shutting_down = true;
+
+  time_t start_time = time(NULL);
+  bool sessions_active = true;
+
+  while (sessions_active) {
+    pthread_mutex_lock(&server.sessions_mutex);
+    sessions_active = (server.sessions_count > 0);
+    pthread_mutex_unlock(&server.sessions_mutex);
+
+    if (!sessions_active) {
+      logger_info("All client sessions closed");
+      break;
+    }
+
+    if (time(NULL) - start_time >= MAX_WAIT_SEC) {
+      logger_info("Graceful shutdown timeout (%d sec), forcing close", MAX_WAIT_SEC);
+      break;
+    }
+  }
+
+  server.running = false;
   for (size_t i = 0; i < server.worker_count; i++) {
     pthread_join(server.workers[i], NULL);
   }
@@ -575,7 +620,6 @@ void server_stop() {
     free_session(&server.sessions[i]);
     pthread_mutex_destroy(&server.sessions[i].mutex);
   }
-
   if (server.sessions) {
     munmap(server.sessions, server.sessions_capacity * sizeof(client_session));
   }
@@ -584,5 +628,5 @@ void server_stop() {
   pthread_mutex_destroy(&server.sessions_mutex);
   pthread_mutex_destroy(&server.listen_mutex);
 
-  logger_info("Server stopped");
+  logger_info("Server stopped gracefully");
 }
