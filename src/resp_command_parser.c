@@ -7,20 +7,21 @@
 #include <ctype.h>
 
 #include "resp_command_parser.h"
+#include "logger.h"
 
-static void *resp_alloc(size_t size){
+static void *resp_alloc(const size_t size){
     void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return (ptr == MAP_FAILED) ? NULL : ptr;
 }
 
-static void resp_free(void *ptr, size_t size) {
+static void resp_free(void *ptr, const size_t size) {
   if (ptr && ptr != MAP_FAILED) {
     munmap(ptr, size);
   }
 }
 
-static bool parse_integer(const char *str, size_t len, int64_t *out) {
+static bool parse_integer(const char *str, const size_t len, int64_t *out) {
   if (len == 0) return false;
   const char *end = str + len;
   const char *ptr = str;
@@ -40,8 +41,7 @@ static bool parse_integer(const char *str, size_t len, int64_t *out) {
 
   while (ptr < end) {
     if (!isdigit((unsigned char)*ptr)) return false;
-    if (__builtin_mul_overflow(value, 10, &value) ||
-        __builtin_add_overflow(value, (*ptr - '0'), &value)) {
+    if (__builtin_mul_overflow(value, 10, &value) || __builtin_add_overflow(value, (*ptr - '0'), &value)) {
       return false;
     }
     ptr++;
@@ -53,6 +53,9 @@ static bool parse_integer(const char *str, size_t len, int64_t *out) {
 
 static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size_t *out_len) {
   const char *ptr = *start_ptr;
+  int64_t len;
+  char *data;
+
   if (ptr >= end_ptr || *ptr != '$') return NULL;
   ptr++;
 
@@ -60,7 +63,6 @@ static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size
   while (ptr < end_ptr && *ptr != '\r') ptr++;
   if (ptr >= end_ptr || ptr + 1 >= end_ptr || ptr[1] != '\n') return NULL;
 
-  int64_t len;
   if (!parse_integer(num_start, ptr - num_start, &len)) return NULL;
   ptr += 2;  // skip \r\n
 
@@ -74,7 +76,7 @@ static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size
     return NULL;
   }
 
-  char *data = resp_alloc((size_t)len + 1);
+  data = resp_alloc((size_t)len + 1);
   if (!data) return NULL;
 
   if (len > 0) {
@@ -96,6 +98,8 @@ static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size
 
 static bool parse_command(const char **start_ptr, const char *end_ptr, resp_command *cmd) {
   const char *ptr = *start_ptr;
+  int64_t count;
+
   if (ptr >= end_ptr || *ptr != '*') return false;
 
   ptr++;
@@ -103,7 +107,6 @@ static bool parse_command(const char **start_ptr, const char *end_ptr, resp_comm
   while (ptr < end_ptr && *ptr != '\r') ptr++;
   if (ptr >= end_ptr || ptr + 1 >= end_ptr || ptr[1] != '\n') return false;
 
-  int64_t count;
   if (!parse_integer(num_start, ptr - num_start, &count)) return false;
   ptr += 2;  // \r\n
 
@@ -133,7 +136,7 @@ static bool parse_command(const char **start_ptr, const char *end_ptr, resp_comm
     size_t arg_len;
     cmd->args[i] = parse_bulk_string(&ptr, end_ptr, &arg_len);
     if (!cmd->args[i] && arg_len != 0) {
-      // pzrsing error
+      // parsing error
       for (size_t j; j < i; ++j) {
         resp_free(cmd->args[j], cmd->args_lens[j] + 1);
       }
@@ -267,6 +270,28 @@ resp_list_commands* resp_parse(const char* buffer, const size_t len, size_t* con
     return NULL;
   }
 
+  size_t calculated_consumed = start_ptr - buffer;
+  if (calculated_consumed > len) {
+    logger_error("Parser overflow: %zu > %zu", calculated_consumed, len);
+
+    for (size_t i = 0; i < commands_parsed; i++) {
+      if (commands[i].command)
+        resp_free(commands[i].command, commands[i].command_len);
+      if (commands[i].args) {
+        for (size_t j = 0; j < commands[i].args_num; j++) {
+          if (commands[i].args[j])
+            resp_free(commands[i].args[j], commands[i].args_lens[j]);
+        }
+        resp_free(commands[i].args, sizeof(char *) * commands[i].args_num);
+        resp_free(commands[i].args_lens, sizeof(size_t) * commands[i].args_num);
+      }
+    }
+    resp_free(commands, sizeof(resp_command) * capacity);
+
+    *consumed = 0;
+    return NULL;
+  }
+
   resp_list_commands *result = resp_alloc(sizeof(resp_list_commands));
   if (!result) {
     for (size_t i = 0; i < commands_parsed; i++) {
@@ -314,7 +339,7 @@ void resp_free_command_list(resp_list_commands *list) {
   resp_free(list, sizeof(resp_list_commands));
 }
 
-//Serialization
+// Serialization
 char *resp_serialize_simple_string(const char *str) {
   if (!str) return NULL;
 
@@ -322,6 +347,7 @@ char *resp_serialize_simple_string(const char *str) {
   size_t total_len = 1 + len + 2 + 1;  // +\r\n\0
   char *buffer = resp_alloc(total_len);
   if (!buffer) return NULL;
+
   int written = snprintf(buffer, total_len, "+%s\r\n", str);
   if (written < 0 || (size_t)written >= total_len) {
     resp_free(buffer, total_len);
@@ -337,6 +363,7 @@ char *resp_serialize_error(const char *msg) {
   size_t total_len = 1 + len + 2 + 1;  // -\r\n\0
   char *buffer = resp_alloc(total_len);
   if (!buffer) return NULL;
+
   int written = snprintf(buffer, total_len, "-%s\r\n", msg);
   if (written < 0 || (size_t)written >= total_len) {
     resp_free(buffer, total_len);
@@ -345,17 +372,22 @@ char *resp_serialize_error(const char *msg) {
   return buffer;
 }
 
-char *resp_serialize_bulk_string(const char *data, size_t len) {
+char *resp_serialize_bulk_string(const char *data, const size_t len) {
   size_t num_len = 1;
   size_t tmp = len;
+  size_t total_len = 0;
+  char *buffer;
+  int written;
+
   while (tmp >= INIT_CAP) {
     num_len++;
     tmp /= INIT_CAP;
   }
-  size_t total_len = 1 + num_len + 2 + len + 2 + 1;  // $<num>\r\n<data>\r\n\0
-  char *buffer = resp_alloc(total_len);
+
+  total_len = 1 + num_len + 2 + len + 2 + 1;  // $<num>\r\n<data>\r\n\0
+  buffer = resp_alloc(total_len);
   if (!buffer) return NULL;
-  int written = snprintf(buffer, total_len, "$%zu\r\n", len);
+  written = snprintf(buffer, total_len, "$%zu\r\n", len);
   if (written < 0 || (size_t)written >= total_len) {
     resp_free(buffer, total_len);
     return NULL;
@@ -377,9 +409,10 @@ char *resp_serialize_nil(void) {
 
 char *resp_serialize_integer(int64_t num) {
   char *buffer = resp_alloc(TOTAL_LEN_INT);
+  int written;
   if (!buffer) return NULL;
 
-  int written = snprintf(buffer, TOTAL_LEN_INT, ":%ld\r\n", num);
+  written = snprintf(buffer, TOTAL_LEN_INT, ":%ld\r\n", num);
   if (written < 0 || (size_t)written >= TOTAL_LEN_INT) {
     resp_free(buffer, TOTAL_LEN_INT);
     return NULL;

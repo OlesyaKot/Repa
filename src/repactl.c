@@ -33,19 +33,21 @@ static void signal_handler(int sig) {
   exit(0);
 }
 
-static char *serialize_command(int argc, char *argv[], size_t *out_len) {
+static char *serialize_command(const int argc, char *argv[], size_t *out_len) {
+  size_t total_len = 0;
+  char *buffer;
+  int offset;
   if (argc == 0) return NULL;
 
-  size_t total_len = 0;
   for (int i = 0; i < argc; i++) {
     total_len += MAX_NUM_LEN + strlen(argv[i]) + 2;
   }
   total_len += MAX_NUM_LEN;
 
-  char *buffer = malloc(total_len);
+  buffer = malloc(total_len);
   if (!buffer) return NULL;
 
-  int offset = snprintf(buffer, total_len, "*%d\r\n", argc);
+  offset = snprintf(buffer, total_len, "*%d\r\n", argc);
 
   for (int i = 0; i < argc; i++) {
     size_t arg_len = strlen(argv[i]);
@@ -60,7 +62,7 @@ static char *serialize_command(int argc, char *argv[], size_t *out_len) {
   return buffer;
 }
 
-static void parse_and_print_response(const char *response, size_t len) {
+static void parse_and_print_response(const char *response, const size_t len) {
   if (len == 0) {
     printf("(no response)\n");
     return;
@@ -118,7 +120,7 @@ static void parse_and_print_response(const char *response, size_t len) {
   }
 }
 
-static char *get_password_secure(void) {
+static char *get_password_secure() {
   struct termios old_term, new_term;
   char *password = NULL;
   size_t len = 0;
@@ -159,20 +161,25 @@ static char *get_password_secure(void) {
   return password;
 }
 
-static bool send_command(int argc, char *argv[]) {
+static bool send_command(const int argc, char *argv[]) {
+  size_t request_len;
+  char *request;
+  ssize_t sent;
+  char response[RESPONSE_BUFF_LEN] = {0};
+  ssize_t bytes_read;
+
   if (sockfd < 0) {
     printf("(not connected)\n");
     return false;
   }
 
-  size_t request_len;
-  char *request = serialize_command(argc, argv, &request_len);
+  request = serialize_command(argc, argv, &request_len);
   if (!request) {
     printf("Error: Failed to serialize command\n");
     return false;
   }
 
-  ssize_t sent = send(sockfd, request, request_len, 0);
+  sent = send(sockfd, request, request_len, 0);
   free(request); 
 
   if (sent < 0) {
@@ -181,9 +188,7 @@ static bool send_command(int argc, char *argv[]) {
     return false;
   }
 
-  char response[RESPONSE_BUFF_LEN] = {0};
-  ssize_t bytes_read = recv(sockfd, response, sizeof(response) - 1, 0);
-
+  bytes_read = recv(sockfd, response, sizeof(response) - 1, 0);
   if (bytes_read <= 0) {
     printf("(connection closed)\n");
     sockfd = -1;
@@ -196,18 +201,21 @@ static bool send_command(int argc, char *argv[]) {
 }
 
 static int command_handler(char *line) {
+  int argc = 0;
+  char **args;
+  char *token;
+
   if (!line || !*line) return 0;
 
   add_history(line);
 
-  char **args = malloc(COMMAND_CAPACITY * sizeof(char *));
+  args = malloc(COMMAND_CAPACITY * sizeof(char *));
   if (!args) {
     printf("Error: Out of memory\n");
     return 0;
   }
 
-  int argc = 0;
-  char *token = strtok(line, " \t");
+  token = strtok(line, " \t");
   while (token && argc < COMMAND_CAPACITY) {
     args[argc++] = token;
     token = strtok(NULL, " \t");
@@ -227,7 +235,7 @@ static int command_handler(char *line) {
   return 0;
 }
 
-static int connect_to_server(const char *addr, int port) {
+static int connect_to_server(const char *addr, const int port) {
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd < 0) return -1;
 
@@ -240,8 +248,7 @@ static int connect_to_server(const char *addr, int port) {
     return -1;
   }
 
-  if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) <
-      0) {
+  if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
     close(sockfd);
     return -1;
   }
@@ -267,6 +274,8 @@ int main(int argc, char *argv[]) {
   const char *addr = DEFAULT_IP_ADDR;
   int port = DEFAULT_PORT;
   const char *username = NULL;
+  char *auth_user = NULL;
+  char *auth_pass = NULL;
 
   int command_start = -1;
   for (int i = 1; i < argc; i++) {
@@ -292,9 +301,6 @@ int main(int argc, char *argv[]) {
   }
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
-
-  char *auth_user = NULL;
-  char *auth_pass = NULL;
 
   if (username) {
     auth_user = strdup(username);

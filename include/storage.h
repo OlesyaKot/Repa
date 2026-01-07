@@ -7,6 +7,7 @@
 #define DEFAULT_CAPACITY 16
 #define HASH_VALUE 5381
 #define HASH_SHIFT 5
+#define LOAD_FACTOR 0.75
 
 bool storage_init(const size_t max_memory_bytes);
 void storage_destroy();

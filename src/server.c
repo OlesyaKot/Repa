@@ -51,10 +51,12 @@ typedef struct {
 static server_state server;
 
 static void free_session(client_session *session) {
-  if (session->fd >= 0) {
-    close(session->fd);
-    session->fd = -1;
-  }
+  if (session->fd < 0)
+    return;
+
+  close(session->fd);
+  session->fd = -1;
+  
   if (session->input_buffer) {
     munmap(session->input_buffer, session->input_capacity);
     session->input_buffer = NULL;
@@ -62,14 +64,17 @@ static void free_session(client_session *session) {
   session->input_len = 0;
   session->input_capacity = 0;
   session->is_auth = false;
+  session->should_close = false;
 }
 
 static bool expand_input_buf(client_session *session, const size_t needed) {
+  size_t new_capacity;
+  char *new_buffer;
   if (session->input_capacity >= needed) return true;
 
   if (needed > MAX_INPUT_BUFFER_SIZE) return false;
 
-  size_t new_capacity = session->input_capacity;
+  new_capacity = session->input_capacity;
   if (new_capacity == 0) new_capacity = INPUT_BUFFER_INITIAL_SIZE;
   while (new_capacity < needed) {
     new_capacity *= 2;
@@ -77,8 +82,8 @@ static bool expand_input_buf(client_session *session, const size_t needed) {
   if (new_capacity > MAX_INPUT_BUFFER_SIZE) {
     new_capacity = MAX_INPUT_BUFFER_SIZE;
   }
-
-  char *new_buffer = mmap(NULL, new_capacity, PROT_READ | PROT_WRITE,
+  
+  new_buffer = mmap(NULL, new_capacity, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (new_buffer == MAP_FAILED) return false;
 
@@ -99,12 +104,14 @@ static void send_response(const int client_fd, char *response) {
 }
 
 static void handle_command(client_session* session, resp_command* cmd) {
+  char *cmd_upper;
+
   if (!cmd || !cmd->command) {
     send_response(session->fd, resp_serialize_error("ERR invalid command"));
     return;
   }
 
-  char *cmd_upper = mmap(NULL, cmd->command_len + 1, PROT_READ | PROT_WRITE,
+  cmd_upper = mmap(NULL, cmd->command_len + 1, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (!cmd_upper) {
     send_response(session->fd, resp_serialize_error("ERR oom"));
@@ -158,8 +165,7 @@ static void handle_command(client_session* session, resp_command* cmd) {
         send_response(session->fd, resp_serialize_simple_string("OK"));
         stats_inc_cmd_other();
       } else {
-        send_response(session->fd,
-                      resp_serialize_error("ERR invalid password"));
+        send_response(session->fd, resp_serialize_error("ERR invalid password"));
       }
     } else if (cmd->args_num == 2) {
       // AUTH <username> <password> - new format
@@ -184,13 +190,12 @@ static void handle_command(client_session* session, resp_command* cmd) {
       if (val) {
         send_response(session->fd, resp_serialize_bulk_string(val, val_len));
         munmap(val, val_len);
-        stats_inc_cmd_get();
         stats_inc_hit();
       } else {
         send_response(session->fd, resp_serialize_nil());
-        stats_inc_cmd_get();
         stats_inc_miss();
       }
+      stats_inc_cmd_get();
     } else {
       send_response(session->fd, resp_serialize_error("ERR wrong number of arguments for 'GET' command"));
     }
@@ -230,11 +235,10 @@ static void handle_command(client_session* session, resp_command* cmd) {
     if (cmd->args_num == 1) {
       if (storage_del(cmd->args[0], cmd->args_lens[0])) {
         send_response(session->fd, resp_serialize_integer(1));
-        stats_inc_cmd_del();
       } else {
         send_response(session->fd, resp_serialize_integer(0));
-        stats_inc_cmd_del();
       }
+      stats_inc_cmd_del();
     } else {
       send_response(session->fd,
                     resp_serialize_error("ERR wrong number of arguments for 'DEL' command"));
@@ -392,8 +396,14 @@ static void* worker_thread_func(void* args) {
               if (session->should_close) {
                 free_session(session);
               } else if (consumed > 0) {
-                memmove(session->input_buffer, session->input_buffer + consumed, session->input_len - consumed);
-                session->input_len -= consumed;
+                if (consumed <= session->input_len) {
+                  memmove(session->input_buffer, session->input_buffer + consumed,
+                          session->input_len - consumed);
+                  session->input_len -= consumed;
+                } else {
+                  logger_error("Invalid consumed size: %zu > %zu. Closing connection.", consumed, session->input_len);
+                  free_session(session);
+                }
               }
             } else if (consumed == 0 && session->input_len >= MAX_INPUT_BUFFER_SIZE) {
               logger_error("Invalid RESP data, closing connection");
@@ -418,7 +428,7 @@ static void* worker_thread_func(void* args) {
       }
     }
     if (!found) {
-        pthread_mutex_unlock(&server.sessions_mutex);
+      pthread_mutex_unlock(&server.sessions_mutex);
     }
   }
 
@@ -578,7 +588,10 @@ bool server_start(const int port, const size_t worker_count) {
 }
 
 void server_stop() {
-  logger_info("Initiating graceful shutdown...");
+  time_t start_time;
+  bool sessions_active = true;
+
+  logger_info("Initiating graceful shutdown");
 
   pthread_mutex_lock(&server.listen_mutex);
   if (server.listen_fd >= 0) {
@@ -589,9 +602,7 @@ void server_stop() {
 
   server.shutting_down = true;
 
-  time_t start_time = time(NULL);
-  bool sessions_active = true;
-
+  start_time = time(NULL);
   while (sessions_active) {
     pthread_mutex_lock(&server.sessions_mutex);
     sessions_active = (server.sessions_count > 0);

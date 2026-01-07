@@ -27,24 +27,25 @@ static statistics stats;
 
 // transfer numbers to format with comma (ex. 1,256,844)
 static void format_number(char* buffer, const size_t buf_size, const uint64_t number) {
-  if (buf_size == 0) {
+  char src[LEN_NUM];
+  int len;
+  char res[LEN_NUM];
+  int res_len = 0;
+  int digit_count = 0;
+  
+  if (buf_size == 0)
     return;
-  }
+  
   if (number == 0) {
     snprintf(buffer, buf_size, "0");
     return;
   }
 
-  char src[LEN_NUM];
-  int len = snprintf(src, sizeof(src), "%llu", (unsigned long long)number);
+  len = snprintf(src, sizeof(src), "%llu", (unsigned long long)number);
   if (len <= 0 || len >= (int)sizeof(src)) {
     snprintf(buffer, buf_size, "0");
     return;
   }
-
-  char res[LEN_NUM]; 
-  int res_len = 0;
-  int digit_count = 0;
 
   for (int i = len - 1; i >= 0; i--) {
     if (digit_count > 0 && digit_count % LEN_BETWEEN_COMMAS == 0) {

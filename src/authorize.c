@@ -25,9 +25,12 @@ static bool safe_strcmp(const char* a, const char* b) {
 }
 
 static char* auth_strdup(const char* str) {
+  size_t len;
+  char *copy;
+
   if (!str) return NULL;
-  size_t len = strlen(str) + 1;
-  char* copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
+  len = strlen(str) + 1;
+  copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (copy == MAP_FAILED) return NULL;
   memcpy(copy, str, len);
@@ -88,12 +91,13 @@ void authorize_set_password(const char* new_password) {
 }
 
 bool authorize_check_auth(const char* username, const char* password) {
+  bool result;
   if (!username || !password)
     return false;
 
   pthread_rwlock_wrlock(&server_auth.lock);
 
-  bool result = false;
+  result = false;
   if (server_auth.is_initialized) {
     bool user_ok = (strcasecmp(username, server_auth.user) == 0);
     bool pass_ok = safe_strcmp(password, server_auth.password);

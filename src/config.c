@@ -35,9 +35,12 @@ typedef struct {
 static repa_config config;
 
 static char *config_strdup(const char *str) {
+  size_t len;
+  char *copy;
+
   if (!str) return NULL;
-  size_t len = strlen(str) + 1;
-  char *copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
+  len = strlen(str) + 1;
+  copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (copy == MAP_FAILED) return NULL;
   memcpy(copy, str, len);
@@ -53,12 +56,13 @@ static void config_free_str(char *str) {
 static char *config_asprintf(const char *format, ...) {
   va_list args;
   va_start(args, format);
+  char *buf;
   int len = vsnprintf(NULL, 0, format, args);
   va_end(args);
 
   if (len <= 0) return NULL;
 
-  char *buf = mmap(NULL, len + 1, PROT_READ | PROT_WRITE,
+  buf = mmap(NULL, len + 1, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (buf == MAP_FAILED) return NULL;
 
@@ -146,7 +150,7 @@ static bool handle_help(const char *value) {
   return true;
 }
 
-static const char *get_config_path_from_cli(int argc, char *argv[]) {
+static const char *get_config_path_from_cli(const int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
       return argv[++i];
@@ -155,7 +159,7 @@ static const char *get_config_path_from_cli(int argc, char *argv[]) {
   return DEFAULT_CONFIG_PATH;
 }
 
-static void apply_cli_flags(int argc, char *argv[]) {
+static void apply_cli_flags(const int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
       handle_port(argv[++i]);
@@ -174,7 +178,14 @@ static void apply_cli_flags(int argc, char *argv[]) {
 }
 
 static bool config_load_file(const char *path) {
-  int fd = open(path, O_RDONLY);
+  int fd;
+  struct stat sb;
+  size_t file_size;
+  char *data;
+  char *start;
+  char *end;
+
+  fd = open(path, O_RDONLY);
   if (fd == -1) {
     if (errno != ENOENT) {
       logger_error("Failed to open config file: %s", path);
@@ -182,7 +193,6 @@ static bool config_load_file(const char *path) {
     return false;
   }
 
-  struct stat sb;
   if (fstat(fd, &sb) == -1) {
     close(fd);
     return false;
@@ -193,19 +203,21 @@ static bool config_load_file(const char *path) {
     return true;
   }
 
-  size_t file_size = (size_t)sb.st_size;
-  char *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  file_size = (size_t)sb.st_size;
+  data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (data == MAP_FAILED) {
     close(fd);
     return false;
   }
 
-  char *start = data;
-  char *end = data + file_size;
+  start = data;
+  end = data + file_size;
 
   while (start < end) {
     char *end_of_line = memchr(start, '\n', end - start);
-    if (!end_of_line) end_of_line = end;
+    if (!end_of_line){
+      end_of_line = end;
+    }
 
     char *curr = start;
     while (curr < end_of_line && isspace((unsigned char)*curr)) curr++;
@@ -281,7 +293,7 @@ static bool config_load_file(const char *path) {
   return true;
 }
 
-void config_init(int argc, char *argv[]) {
+void config_init(const int argc, char *argv[]) {
   if (pthread_mutex_init(&config.mutex, NULL) != 0) {
     logger_error("Failed to initialize config mutex");
     exit(1);
@@ -312,6 +324,7 @@ void config_destroy() {
 }
 
 bool config_set(const char *param, const char *value) {
+  bool result;
   if (!param || !value) return false;
 
   pthread_mutex_lock(&config.mutex);
@@ -320,7 +333,7 @@ bool config_set(const char *param, const char *value) {
     return false;
   }
 
-  bool result = false;
+  result = false;
 
   if (strcasecmp(param, "maxmemory") == 0) {
     size_t bytes;
@@ -342,10 +355,14 @@ bool config_set(const char *param, const char *value) {
 }
 
 // Getters
-int config_get_port() { return config.port; }
+int config_get_port() { 
+  return config.port; 
+}
 
 char *config_get_param(const char *param) {
-  if (!param) return NULL;
+  char *result;
+  if (!param)
+    return NULL;
 
   pthread_mutex_lock(&config.mutex);
 
@@ -354,8 +371,7 @@ char *config_get_param(const char *param) {
     return NULL;
   }
 
-  char *result = NULL;
-
+  result = NULL;
   if (strcasecmp(param, "maxmemory") == 0) {
     result = config_asprintf("%zu", config.max_memory_size_bytes);
   } else if (strcasecmp(param, "loglevel") == 0) {

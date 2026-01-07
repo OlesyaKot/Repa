@@ -45,7 +45,7 @@ static uint32_t get_hash(const char *str, const size_t len) {
   return hash;
 }
 
-static void *storage_alloc(size_t size) {
+static void *storage_alloc(const size_t size) {
   void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   return (ptr == MAP_FAILED) ? NULL : ptr;
@@ -136,7 +136,7 @@ static bool evict_lru(const size_t needed) {
 }
 
 static bool expand_table() {
-  if (store.size < store.capacity * 0.75) return true;
+  if (store.size < store.capacity * LOAD_FACTOR) return true;
 
   size_t new_capacity = store.capacity * 2;
   if (new_capacity == 0) new_capacity = DEFAULT_CAPACITY;
@@ -211,6 +211,11 @@ bool storage_set(const char* key, const size_t key_size, const char* value, cons
 
   uint32_t idx = get_hash(key, key_size) % store.capacity;
   kv_node *node = NULL;
+  size_t new_node_size = 0;
+  size_t old_node_size = 0;
+  size_t needed_mem = 0;
+  kv_node *new_node;
+
   if (store.buckets) {
     node = store.buckets[idx];
     while(node) {
@@ -221,13 +226,12 @@ bool storage_set(const char* key, const size_t key_size, const char* value, cons
     }
   }
 
-  size_t new_node_size = sizeof(kv_node) + key_size + value_size;
-  size_t old_node_size = 0;
+  new_node_size = sizeof(kv_node) + key_size + value_size;
   if (node) {
     old_node_size = sizeof(kv_node) + node->key_size + node->value_size;
   }
 
-  size_t needed_mem = (node) ? (new_node_size - old_node_size) : new_node_size;
+  needed_mem = (node) ? (new_node_size - old_node_size) : new_node_size;
 
   evict_expire_nodes();
   if (store.used_mem + needed_mem > store.max_mem) {
@@ -241,7 +245,6 @@ bool storage_set(const char* key, const size_t key_size, const char* value, cons
     return false;
   }
 
-  kv_node *new_node;
   if (node) {
     storage_free(node->value, node->value_size);
     node->value = storage_alloc(value_size);
