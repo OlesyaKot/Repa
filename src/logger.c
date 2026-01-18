@@ -1,23 +1,28 @@
 #define _GNU_SOURCE
 
+#include "logger.h"
+
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <strings.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "logger.h"
+#define LOG_BUFFER_SIZE 1024
+#define LEN_TIME 32
+#define MSEC_IN_NSEC 1000000
+#define PERMISSIONS 0644
 
 static struct {
-    logger_level level;
-    int fd;   // -1 - if output is stdout
-    pthread_mutex_t file_mutex;
-    bool is_init;
+  logger_level level;
+  int fd;   // -1 - if output is stdout
+  pthread_mutex_t file_mutex;
+  bool is_init;
+  bool mutex_initialized;
 } logger_stat;
 
 static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -31,10 +36,11 @@ void logger_init(const logger_level level, const char *logger_file) {
   }
 
   logger_stat.level = level;
+  logger_stat.mutex_initialized = false;
+
   if (logger_file && logger_file[0] != '\0') {
     int fd = open(logger_file, O_WRONLY | O_CREAT | O_APPEND, PERMISSIONS);
     if (fd == -1) {
-      // error - use stderr
       logger_stat.fd = STDERR_FILENO;
       const char err_message[] = "[logger] Failed to open log file, using stderr\n";
       write(logger_stat.fd, err_message, sizeof(err_message) - 1);
@@ -45,12 +51,18 @@ void logger_init(const logger_level level, const char *logger_file) {
     logger_stat.fd = STDOUT_FILENO;
   }
 
-  pthread_mutex_init(&logger_stat.file_mutex, NULL);
+  if (pthread_mutex_init(&logger_stat.file_mutex, NULL) != 0) {
+    logger_error("Failed to init logger file mutex");
+    logger_stat.fd = STDERR_FILENO;
+  } else {
+    logger_stat.mutex_initialized = true;
+  }
+
   logger_stat.is_init = true;
   pthread_mutex_unlock(&init_mutex);
 }
 
-void logger_destroy() {
+void logger_destroy(void) {
   pthread_mutex_lock(&init_mutex);
   if (!logger_stat.is_init) {
     pthread_mutex_unlock(&init_mutex);
@@ -58,16 +70,19 @@ void logger_destroy() {
   }
 
   if (logger_stat.fd >= 0 && logger_stat.fd != STDOUT_FILENO && logger_stat.fd != STDERR_FILENO) {
-      close(logger_stat.fd);
-      pthread_mutex_unlock(&init_mutex);
-    }
-
-    logger_stat.is_init = false;
-    logger_stat.fd = -1;
-    logger_stat.level = INFO;
-
-    pthread_mutex_unlock(&init_mutex);
+    close(logger_stat.fd);
   }
+
+  if (logger_stat.mutex_initialized) {
+    pthread_mutex_destroy(&logger_stat.file_mutex);
+  }
+  logger_stat.is_init = false;
+  logger_stat.fd = -1;
+  logger_stat.level = INFO;
+  logger_stat.mutex_initialized = false;
+  
+  pthread_mutex_unlock(&init_mutex);
+}
 
 static const char *level_to_str(const logger_level level){
   switch (level){
@@ -88,8 +103,7 @@ static void logger_write(const logger_level level, const char *format, va_list a
   if (!logger_stat.is_init) return;
   if (level < logger_stat.level) return;
 
-  char *buffer = mmap(NULL, LOG_BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (buffer == MAP_FAILED) return;
+  char buffer[LOG_BUFFER_SIZE];
 
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -119,8 +133,6 @@ static void logger_write(const logger_level level, const char *format, va_list a
   pthread_mutex_lock(&logger_stat.file_mutex);
   write(logger_stat.fd, buffer, len);
   pthread_mutex_unlock(&logger_stat.file_mutex);
-
-  munmap(buffer, LOG_BUFFER_SIZE);
 }
 
 void logger_debug(const char *format, ...) {

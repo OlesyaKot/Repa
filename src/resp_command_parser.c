@@ -1,25 +1,18 @@
-#define _GNU_SOURCE
+#include "resp_command_parser.h"
 
-#include <sys/mman.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <ctype.h>
 
-#include "resp_command_parser.h"
 #include "logger.h"
 
-static void *resp_alloc(const size_t size){
-    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (ptr == MAP_FAILED) ? NULL : ptr;
-}
-
-static void resp_free(void *ptr, const size_t size) {
-  if (ptr && ptr != MAP_FAILED) {
-    munmap(ptr, size);
-  }
-}
+#define MAX_COMMAND_ARGS 64
+#define MAX_COMMAND_LEN 1024 * 1024  // 1MB
+#define INIT_CAP 4
+#define TOTAL_LEN_NIL 7   // "$-1\r\n\0"
+#define TOTAL_LEN_INT 32  // for int64 + \r\n\0
 
 static bool parse_integer(const char *str, const size_t len, int64_t *out) {
   if (len == 0) return false;
@@ -41,9 +34,12 @@ static bool parse_integer(const char *str, const size_t len, int64_t *out) {
 
   while (ptr < end) {
     if (!isdigit((unsigned char)*ptr)) return false;
-    if (__builtin_mul_overflow(value, 10, &value) || __builtin_add_overflow(value, (*ptr - '0'), &value)) {
-      return false;
-    }
+    if (value > (INT64_MAX / 10)) return false;
+    value *= 10;
+
+    int digit = (*ptr - '0');
+    if (value > (INT64_MAX - digit)) return false;
+    value += digit;
     ptr++;
   }
 
@@ -51,10 +47,11 @@ static bool parse_integer(const char *str, const size_t len, int64_t *out) {
   return true;
 }
 
-static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size_t *out_len) {
+static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size_t *out_len, bool *is_nil) {
   const char *ptr = *start_ptr;
   int64_t len;
   char *data;
+  *is_nil = false;
 
   if (ptr >= end_ptr || *ptr != '$') return NULL;
   ptr++;
@@ -68,35 +65,36 @@ static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size
 
   if (len == -1) {
     *out_len = 0;
+    *is_nil = true;
     *start_ptr = ptr;
-    return NULL;  // nil
+    return NULL;
   }
 
   if (len < 0 || len > MAX_COMMAND_LEN || ptr + len + 2 > end_ptr) {
     return NULL;
   }
 
-  data = resp_alloc((size_t)len + 1);
+  data = malloc(len + 1);
   if (!data) return NULL;
 
   if (len > 0) {
     memcpy(data, ptr, (size_t)len);
   }
-  data[len] = '\0'; 
-
+  data[len] = '\0';
+  *out_len = (size_t)len;
   ptr += len;
+  
   if (ptr + 2 > end_ptr || ptr[0] != '\r' || ptr[1] != '\n') {
-    resp_free(data, (size_t)len + 1);
+    free(data);
     return NULL;
   }
   ptr += 2;
 
-  *out_len = (size_t)len;
   *start_ptr = ptr;
-  return data;  
+  return data;
 }
 
-static bool parse_command(const char **start_ptr, const char *end_ptr, resp_command *cmd) {
+static bool parse_resp_array(const char **start_ptr, const char *end_ptr, resp_command *cmd) {
   const char *ptr = *start_ptr;
   int64_t count;
 
@@ -108,85 +106,203 @@ static bool parse_command(const char **start_ptr, const char *end_ptr, resp_comm
   if (ptr >= end_ptr || ptr + 1 >= end_ptr || ptr[1] != '\n') return false;
 
   if (!parse_integer(num_start, ptr - num_start, &count)) return false;
-  ptr += 2;  // \r\n
+  ptr += 2;
 
   if (count < 0 || count > MAX_COMMAND_ARGS) return false;
 
   if (count == 0) {
-    cmd->command = NULL;
-    cmd->command_len = 0;
-    cmd->args = NULL;
-    cmd->args_lens = NULL;
-    cmd->args_num = 0;
+    memset(cmd, 0, sizeof(resp_command));
     *start_ptr = ptr;
     return true;
   }
 
-  cmd->args = resp_alloc(sizeof(char *) * (size_t)count);
-  if (!cmd->args) {
+  cmd->args = calloc(count, sizeof(char *));
+  if (!cmd->args) 
     return false;
-  }
-  cmd->args_lens = resp_alloc(sizeof(size_t) * (size_t)count);
+
+  cmd->args_lens = calloc(count, sizeof(size_t));
   if (!cmd->args_lens) {
-    resp_free(cmd->args, sizeof(char *) * (size_t)count);
+    free(cmd->args);
+    cmd->args = NULL;
     return false;
   }
 
-  for (size_t i = 0; i < (size_t)count; ++i) {
-    size_t arg_len;
-    cmd->args[i] = parse_bulk_string(&ptr, end_ptr, &arg_len);
-    if (!cmd->args[i] && arg_len != 0) {
-      // parsing error
-      for (size_t j; j < i; ++j) {
-        resp_free(cmd->args[j], cmd->args_lens[j] + 1);
+  for (int i = 0; i < count; ++i) {
+    bool is_nil = false;
+    size_t arg_len = 0;
+    char *arg = parse_bulk_string(&ptr, end_ptr, &arg_len, &is_nil);
+
+    if (!arg && !is_nil) {
+      for (int j = 0; j < i; ++j) {
+        free(cmd->args[j]);
       }
-      resp_free(cmd->args, sizeof(char *) * (size_t)count);
-      resp_free(cmd->args_lens, sizeof(size_t) * (size_t)count);
+      free(cmd->args);
+      free(cmd->args_lens);
+      memset(cmd, 0, sizeof(resp_command));
       return false;
     }
+
+    cmd->args[i] = arg;
     cmd->args_lens[i] = arg_len;
   }
 
-  // command name = first arg
-  if (count > 0) {
-    if (cmd->args_lens[0] > 0) {
-      cmd->command = resp_alloc(cmd->args_lens[0]);
-      if (!cmd->command) {
-        for (int64_t i = 0; i < count; i++) {
-          if (cmd->args[i]) resp_free(cmd->args[i], cmd->args_lens[i]);
-        }
-        resp_free(cmd->args, sizeof(char *) * count);
-        resp_free(cmd->args_lens, sizeof(size_t) * count);
-        return false;
-      }
-      memcpy(cmd->command, cmd->args[0], cmd->args_lens[0]);
-    } else {
-      cmd->command = NULL; 
-    }
+  if (count > 0 && cmd->args[0]) {
+    cmd->command = strdup(cmd->args[0]);
     cmd->command_len = cmd->args_lens[0];
+    if (!cmd->command) {
+      for (int i = 0; i < count; ++i) {
+        free(cmd->args[i]);
+      }
+      free(cmd->args);
+      free(cmd->args_lens);
+      memset(cmd, 0, sizeof(resp_command));
+      return false;
+    }
 
+    free(cmd->args[0]);
     if (count > 1) {
-      memmove(cmd->args, cmd->args + 1, sizeof(char *) * ((size_t)count - 1));
-      memmove(cmd->args_lens, cmd->args_lens + 1,
-              sizeof(size_t) * ((size_t)count - 1));
+      memmove(cmd->args, cmd->args + 1, sizeof(char *) * (count - 1));
+      memmove(cmd->args_lens, cmd->args_lens + 1, sizeof(size_t) * (count - 1));
       cmd->args_num = (size_t)count - 1;
     } else {
-      resp_free(cmd->args, sizeof(char *) * count);
-      resp_free(cmd->args_lens, sizeof(size_t) * count);
+      free(cmd->args);
+      free(cmd->args_lens);
       cmd->args = NULL;
       cmd->args_lens = NULL;
       cmd->args_num = 0;
     }
+  } else {
+    for (int i = 0; i < count; ++i) {
+      free(cmd->args[i]);
+    }
+    free(cmd->args);
+    free(cmd->args_lens);
+    memset(cmd, 0, sizeof(resp_command));
+    return false;
   }
 
   *start_ptr = ptr;
   return true;
 }
 
-resp_list_commands* resp_parse(const char* buffer, const size_t len, size_t* consumed) {
+static bool parse_simple_line(const char **start_ptr, const char *end_ptr, resp_command *cmd) {
+  const char *ptr = *start_ptr;
+  const char *line_end = ptr;
+
+  while (line_end < end_ptr && *line_end != '\r' && *line_end != '\n') {
+    line_end++;
+  }
+
+  if (line_end == ptr) return false;
+
+  size_t line_len = line_end - ptr;
+  char *line_copy = malloc(line_len + 1);
+  if (!line_copy) return false;
+  memcpy(line_copy, ptr, line_len);
+  line_copy[line_len] = '\0';
+
+  char *argv[MAX_COMMAND_ARGS];
+  int argc = 0;
+  char *saveptr = NULL;
+  char *token = strtok_r(line_copy, " \t", &saveptr);
+
+  while (token && argc < MAX_COMMAND_ARGS) {
+    argv[argc] = strdup(token);
+    if (!argv[argc]) {
+      for (int i = 0; i < argc; i++) {
+        free(argv[i]);
+      }
+      free(line_copy);
+      return false;
+    }
+    argc++;
+    token = strtok_r(NULL, " \t", &saveptr);
+  }
+
+  if (argc == 0) {
+    free(line_copy);
+    return false;
+  }
+
+  cmd->command = argv[0];
+  cmd->command_len = strlen(argv[0]);
+  cmd->args_num = argc - 1;
+
+  if (cmd->args_num > 0) {
+    cmd->args = malloc(sizeof(char *) * cmd->args_num);
+    if (!cmd->args) {
+      for (int i = 0; i < argc; i++){ 
+        free(argv[i]);
+      }
+      free(line_copy);
+      return false;
+    }
+    cmd->args_lens = malloc(sizeof(size_t) * cmd->args_num);
+    if (!cmd->args_lens) {
+      free(cmd->args);
+      for (int i = 0; i < argc; i++) free(argv[i]);
+      free(line_copy);
+      return false;
+    }
+
+    for (size_t i = 0; i < cmd->args_num; i++) {
+      cmd->args[i] = argv[i + 1];
+      cmd->args_lens[i] = strlen(argv[i + 1]);
+    }
+  } else {
+    cmd->args = NULL;
+    cmd->args_lens = NULL;
+  }
+
+  for (int i = 1; i < argc; i++) {
+    free(argv[i]); 
+  }
+  free(line_copy);
+
+  ptr = line_end;
+  if (ptr < end_ptr && *ptr == '\r') ptr++;
+  if (ptr < end_ptr && *ptr == '\n') ptr++;
+
+  *start_ptr = ptr;
+  return true;
+}
+
+static bool parse_command(const char **start_ptr, const char *end_ptr, resp_command *cmd) {
+  const char *ptr = *start_ptr;
+
+  if (ptr >= end_ptr) return false;
+
+  if (*ptr == '*') {
+    return parse_resp_array(start_ptr, end_ptr, cmd);
+  } else {
+    return parse_simple_line(start_ptr, end_ptr, cmd);
+  }
+}
+
+static void resp_free_command(resp_command *cmd) {
+  if (!cmd) return;
+
+  free(cmd->command);
+  cmd->command = NULL;
+
+  if (cmd->args) {
+    for (size_t i = 0; i < cmd->args_num; i++) {
+      free(cmd->args[i]);
+      cmd->args[i] = NULL;
+    }
+    free(cmd->args);
+    cmd->args = NULL;
+  }
+
+  free(cmd->args_lens);
+  cmd->args_lens = NULL;
+  cmd->command_len = 0;
+  cmd->args_num = 0;
+}
+
+resp_list_commands *resp_parse(const char *buffer, const size_t len, size_t *consumed) {
   if (!buffer || len == 0 || !consumed) {
-    if (consumed)
-      *consumed = 0;
+    if (consumed) *consumed = 0;
     return NULL;
   }
 
@@ -195,67 +311,53 @@ resp_list_commands* resp_parse(const char* buffer, const size_t len, size_t* con
   const char *end_ptr = buffer + len;
   size_t commands_parsed = 0;
   size_t capacity = INIT_CAP;
-  resp_command *commands = resp_alloc(sizeof(resp_command) * INIT_CAP);
-  if (!commands)
-    return NULL;
+  resp_command *commands = malloc(sizeof(resp_command) * INIT_CAP);
+  if (!commands) return NULL;
+
+  memset(commands, 0, sizeof(resp_command) * capacity);
 
   while (start_ptr < end_ptr) {
-    if (start_ptr + 1 > end_ptr) break;
-
-    // RESP2 commands starts with *, +, -, :, $
-    char start_type = *start_ptr;
-    if (start_type != '*' && start_type != '+' && start_type != '-' && start_type != ':' && start_type != '$') {
-      break;
+    if (commands_parsed == 0) {
+      while (start_ptr < end_ptr &&
+             (*start_ptr == ' ' || *start_ptr == '\r' || *start_ptr == '\n')) {
+        start_ptr++;
+      }
     }
+
+    if (start_ptr >= end_ptr) break;
 
     const char *cmd_start = start_ptr;
     resp_command cmd = {0};
 
     if (!parse_command(&start_ptr, end_ptr, &cmd)) {
-      // not full command or error
-      if (cmd.args) {
-        for (size_t i = 0; i < cmd.args_num; ++i) {
-          if (cmd.args[i])
-            resp_free(cmd.args[i], cmd.args_lens[i]);
+      if (commands_parsed > 0) {
+        break;
+      } else {
+        for (size_t i = 0; i < commands_parsed; i++) {
+          resp_free_command(&commands[i]);
         }
-        resp_free(cmd.args, sizeof(char *) * cmd.args_num);
-        resp_free(cmd.args_lens, sizeof(size_t) * cmd.args_num);
+        free(commands);
+        *consumed = 0;
+        return NULL;
       }
-      break;
     }
 
-    // add command to list
     if (commands_parsed >= capacity) {
       size_t new_cap = capacity * 2;
-      resp_command *new_commands = resp_alloc(sizeof(resp_command) * new_cap);
+      resp_command *new_commands = malloc(sizeof(resp_command) * new_cap);
       if (!new_commands) {
-        // free curr cmd
-        if (cmd.args) {
-          for (size_t i = 0; i < cmd.args_num; i++) {
-            if (cmd.args[i]) resp_free(cmd.args[i], cmd.args_lens[i]);
-          }
-          resp_free(cmd.args, sizeof(char *) * cmd.args_num);
-          resp_free(cmd.args_lens, sizeof(size_t) * cmd.args_num);
-        }
-        // free other cmd
+        resp_free_command(&cmd);
         for (size_t i = 0; i < commands_parsed; i++) {
-          if (commands[i].command)
-            resp_free(commands[i].command, commands[i].command_len);
-          if (commands[i].args) {
-            for (size_t j = 0; j < commands[i].args_num; j++) {
-              if (commands[i].args[j])
-                resp_free(commands[i].args[j], commands[i].args_lens[j]);
-            }
-            resp_free(commands[i].args, sizeof(char *) * commands[i].args_num);
-            resp_free(commands[i].args_lens, sizeof(size_t) * commands[i].args_num);
-          }
+          resp_free_command(&commands[i]);
         }
-        resp_free(commands, sizeof(resp_command) * capacity);
+        free(commands);
         *consumed = cmd_start - buffer;
         return NULL;
       }
+
       memcpy(new_commands, commands, sizeof(resp_command) * capacity);
-      resp_free(commands, sizeof(resp_command) * capacity);
+      memset(new_commands + capacity, 0, sizeof(resp_command) * (new_cap - capacity));
+      free(commands);
       commands = new_commands;
       capacity = new_cap;
     }
@@ -265,54 +367,25 @@ resp_list_commands* resp_parse(const char* buffer, const size_t len, size_t* con
   }
 
   if (commands_parsed == 0) {
-    resp_free(commands, sizeof(resp_command) * capacity);
+    free(commands);
     *consumed = 0;
     return NULL;
   }
 
-  size_t calculated_consumed = start_ptr - buffer;
-  if (calculated_consumed > len) {
-    logger_error("Parser overflow: %zu > %zu", calculated_consumed, len);
+  *consumed = start_ptr - buffer;
 
-    for (size_t i = 0; i < commands_parsed; i++) {
-      if (commands[i].command)
-        resp_free(commands[i].command, commands[i].command_len);
-      if (commands[i].args) {
-        for (size_t j = 0; j < commands[i].args_num; j++) {
-          if (commands[i].args[j])
-            resp_free(commands[i].args[j], commands[i].args_lens[j]);
-        }
-        resp_free(commands[i].args, sizeof(char *) * commands[i].args_num);
-        resp_free(commands[i].args_lens, sizeof(size_t) * commands[i].args_num);
-      }
-    }
-    resp_free(commands, sizeof(resp_command) * capacity);
-
-    *consumed = 0;
-    return NULL;
-  }
-
-  resp_list_commands *result = resp_alloc(sizeof(resp_list_commands));
+  resp_list_commands *result = malloc(sizeof(resp_list_commands));
   if (!result) {
     for (size_t i = 0; i < commands_parsed; i++) {
-      if (commands[i].command) resp_free(commands[i].command, commands[i].command_len);
-      if (commands[i].args) {
-        for (size_t j = 0; j < commands[i].args_num; j++) {
-          if (commands[i].args[j])
-            resp_free(commands[i].args[j], commands[i].args_lens[j]);
-        }
-        resp_free(commands[i].args, sizeof(char *) * commands[i].args_num);
-        resp_free(commands[i].args_lens, sizeof(size_t) * commands[i].args_num);
-      }
+      resp_free_command(&commands[i]);
     }
-    resp_free(commands, sizeof(resp_command) * capacity);
-    *consumed = start_ptr - buffer;
+    free(commands);
+    *consumed = 0;
     return NULL;
   }
 
   result->commands = commands;
   result->num_commands = commands_parsed;
-  *consumed = start_ptr - buffer;
   return result;
 }
 
@@ -320,37 +393,24 @@ void resp_free_command_list(resp_list_commands *list) {
   if (!list) return;
 
   for (size_t i = 0; i < list->num_commands; i++) {
-    if (list->commands[i].command) {
-      resp_free(list->commands[i].command, list->commands[i].command_len);
-    }
-
-    if (list->commands[i].args) {
-      for (size_t j = 0; j < list->commands[i].args_num; j++) {
-        if (list->commands[i].args[j]) {
-          resp_free(list->commands[i].args[j], list->commands[i].args_lens[j] + 1);
-        }
-      }
-
-      resp_free(list->commands[i].args, sizeof(char *) * list->commands[i].args_num);
-      resp_free(list->commands[i].args_lens, sizeof(size_t) * list->commands[i].args_num);
-    }
+    resp_free_command(&list->commands[i]);
   }
-  resp_free(list->commands, sizeof(resp_command) * list->num_commands);
-  resp_free(list, sizeof(resp_list_commands));
+
+  free(list->commands);
+  free(list);
 }
 
-// Serialization
 char *resp_serialize_simple_string(const char *str) {
   if (!str) return NULL;
 
   size_t len = strlen(str);
-  size_t total_len = 1 + len + 2 + 1;  // +\r\n\0
-  char *buffer = resp_alloc(total_len);
+  size_t total_len = 1 + len + 2 + 1;
+  char *buffer = malloc(total_len);
   if (!buffer) return NULL;
 
   int written = snprintf(buffer, total_len, "+%s\r\n", str);
   if (written < 0 || (size_t)written >= total_len) {
-    resp_free(buffer, total_len);
+    free(buffer);
     return NULL;
   }
   return buffer;
@@ -360,69 +420,64 @@ char *resp_serialize_error(const char *msg) {
   if (!msg) return NULL;
 
   size_t len = strlen(msg);
-  size_t total_len = 1 + len + 2 + 1;  // -\r\n\0
-  char *buffer = resp_alloc(total_len);
+  size_t total_len = 1 + len + 2 + 1;
+  char *buffer = malloc(total_len);
   if (!buffer) return NULL;
 
   int written = snprintf(buffer, total_len, "-%s\r\n", msg);
   if (written < 0 || (size_t)written >= total_len) {
-    resp_free(buffer, total_len);
+    free(buffer);
     return NULL;
   }
   return buffer;
 }
 
 char *resp_serialize_bulk_string(const char *data, const size_t len) {
-  size_t num_len = 1;
-  size_t tmp = len;
-  size_t total_len = 0;
-  char *buffer;
-  int written;
-
-  while (tmp >= INIT_CAP) {
-    num_len++;
-    tmp /= INIT_CAP;
-  }
-
-  total_len = 1 + num_len + 2 + len + 2 + 1;  // $<num>\r\n<data>\r\n\0
-  buffer = resp_alloc(total_len);
-  if (!buffer) return NULL;
-  written = snprintf(buffer, total_len, "$%zu\r\n", len);
-  if (written < 0 || (size_t)written >= total_len) {
-    resp_free(buffer, total_len);
+  if (!data && len > 0) {
     return NULL;
   }
+
+  size_t num_len = 1;
+  for (size_t n = len; n >= 10; n /= 10) {
+    num_len++;
+  }
+
+  size_t total_len = 1 + num_len + 2 + len + 2 + 1;
+  char *buffer = malloc(total_len);
+  if (!buffer) return NULL;
+
+  int written = snprintf(buffer, total_len, "$%zu\r\n", len);
+  if (written < 0 || (size_t)written >= total_len) {
+    free(buffer);
+    return NULL;
+  }
+
   if (len > 0) {
     memcpy(buffer + written, data, len);
-    memcpy(buffer + written + len, "\r\n", 2);
-  } else {
-    memcpy(buffer + written, "\r\n", 2);
   }
+
+  memcpy(buffer + written + len, "\r\n", 2);
+  buffer[total_len - 1] = '\0';
+
   return buffer;
 }
 
 char *resp_serialize_nil(void) {
-  char *buffer = resp_alloc(TOTAL_LEN_NIL);  // $-1\r\n\0
-  if (buffer) snprintf(buffer, TOTAL_LEN_NIL, "$-1\r\n");
+  char *buffer = malloc(TOTAL_LEN_NIL);
+  if (!buffer) return NULL;
+  snprintf(buffer, TOTAL_LEN_NIL, "$-1\r\n");
   return buffer;
 }
 
 char *resp_serialize_integer(int64_t num) {
-  char *buffer = resp_alloc(TOTAL_LEN_INT);
   int written;
+  char *buffer = malloc(TOTAL_LEN_INT);
   if (!buffer) return NULL;
 
-  written = snprintf(buffer, TOTAL_LEN_INT, ":%ld\r\n", num);
+  written = snprintf(buffer, TOTAL_LEN_INT, ":%" PRId64 "\r\n", num);
   if (written < 0 || (size_t)written >= TOTAL_LEN_INT) {
-    resp_free(buffer, TOTAL_LEN_INT);
+    free(buffer);
     return NULL;
   }
   return buffer;
-}
-
-void resp_free_serialized(char *serialized) {
-  if (serialized) {
-    size_t len = strlen(serialized) + 1;
-    resp_free(serialized, len);
-  }
 }

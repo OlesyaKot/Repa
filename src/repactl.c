@@ -1,22 +1,16 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
-#include <ctype.h>
-#include <errno.h>
-#include <netinet/in.h>
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
 #include <termios.h>
-#include <unistd.h>
 
 #define DEFAULT_IP_ADDR "127.0.0.1"
-#define DEFAULT_PORT 6379
+#define DEFAULT_PORT 6380
 #define RESPONSE_BUFF_LEN 8192
 #define COMMAND_CAPACITY 64
 #define RADIX 10
@@ -151,7 +145,8 @@ static char *get_password_secure() {
       }
       password = new_pass;
     }
-    password[len++] = (char)c;
+    password[len] = (char)c;
+    len++;
   }
   password[len] = '\0';
 
@@ -260,7 +255,7 @@ static void print_help(const char *program_name) {
   printf("Usage: %s [OPTIONS]\n", program_name);
   printf("\n");
   printf("Options:\n");
-  printf("  --port <num>     Port number (default: 6379)\n");
+  printf("  --port <num>     Port number (default: 6380)\n");
   printf("  --addr <address> Server address (default: 127.0.0.1)\n");
   printf("  --user <name>    Username for authentication\n");
   printf("\n");

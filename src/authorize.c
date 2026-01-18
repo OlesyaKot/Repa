@@ -1,13 +1,13 @@
 #define _GNU_SOURCE
 
+#include "authorize.h"
+
 #include <pthread.h>
-#include <stdbool.h>
-#include <strings.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
+#include <strings.h>
 
 #include "config.h"
-#include "authorize.h"
 
 typedef struct {
   char* user;
@@ -18,32 +18,12 @@ typedef struct {
 
 static authorization server_auth;
 
-static bool safe_strcmp(const char* a, const char* b) {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  return strcmp(a, b) == 0;
-}
-
-static char* auth_strdup(const char* str) {
-  size_t len;
-  char *copy;
-
-  if (!str) return NULL;
-  len = strlen(str) + 1;
-  copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (copy == MAP_FAILED) return NULL;
-  memcpy(copy, str, len);
-  return copy;
-}
-
-static void free_str(char* str) {
-  if (str && str != MAP_FAILED) {
-    munmap(str, strlen(str) + 1);
+void authorize_init(void) {
+  if (pthread_rwlock_init(&server_auth.lock, NULL) != 0) {
+    logger_error("Failed to initialize auth rwlock");
+    return;
   }
-}
 
-void authorize_init() {
   pthread_rwlock_wrlock(&server_auth.lock);
 
   if (server_auth.is_initialized) {
@@ -54,25 +34,37 @@ void authorize_init() {
   const char* user = config_get_default_user();
   const char* password = config_get_default_password();
 
-  server_auth.user = auth_strdup(user);
-  server_auth.password = auth_strdup(password);
+  server_auth.user = strdup(user);
+  if (!server_auth.user) {
+    pthread_rwlock_unlock(&server_auth.lock);
+    return;
+  }
+  server_auth.password = strdup(password);
+  if (!server_auth.password) {
+    free(server_auth.user);
+    pthread_rwlock_unlock(&server_auth.lock);
+    return;
+  }
   server_auth.is_initialized = true;
 
-  logger_info("Autorization initialized: user='%s", user);
+  logger_info("Authorization initialized: user='%s", user);
 
   pthread_rwlock_unlock(&server_auth.lock);
 }
 
-void authorize_destroy() { 
+void authorize_destroy(void) { 
   pthread_rwlock_wrlock(&server_auth.lock);
 
   if (server_auth.is_initialized) {
-    free_str(server_auth.user);
-    free_str(server_auth.password);
+    free(server_auth.user);
+    free(server_auth.password);
+    server_auth.user = NULL;
+    server_auth.password = NULL;
     server_auth.is_initialized = false;
   }
 
   pthread_rwlock_unlock(&server_auth.lock);
+  pthread_rwlock_destroy(&server_auth.lock);
 }
 
 void authorize_set_password(const char* new_password) {
@@ -82,8 +74,15 @@ void authorize_set_password(const char* new_password) {
   pthread_rwlock_wrlock(&server_auth.lock);
 
   if (server_auth.is_initialized) {
-    free_str(server_auth.password);
-    server_auth.password = auth_strdup(new_password);
+    char* new_pass_copy = strdup(new_password);
+    if (!new_pass_copy) {
+      logger_error("Failed to allocate memory for new password");
+      pthread_rwlock_unlock(&server_auth.lock);
+      return;
+    }
+
+    free(server_auth.password);
+    server_auth.password = new_pass_copy;
     logger_info("Password updated via CONFIG SET");
   }
 
@@ -95,12 +94,12 @@ bool authorize_check_auth(const char* username, const char* password) {
   if (!username || !password)
     return false;
 
-  pthread_rwlock_wrlock(&server_auth.lock);
+  pthread_rwlock_rdlock(&server_auth.lock);
 
   result = false;
   if (server_auth.is_initialized) {
     bool user_ok = (strcasecmp(username, server_auth.user) == 0);
-    bool pass_ok = safe_strcmp(password, server_auth.password);
+    bool pass_ok = (strcmp(password, server_auth.password) == 0);
     result = user_ok && pass_ok;
   }
 

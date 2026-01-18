@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -fsanitize=address -fsanitize=leak -g -I$(INCLUDE_DIR)
-LDFLAGS = -fsanitize=address -fsanitize=leak -pthread
+CFLAGS = -Wall -Wextra -Werror -fsanitize=address -g -pthread -I$(INCLUDE_DIR) -MMD -MP
+LDFLAGS = -fsanitize=address -pthread
 AR = ar
 RANLIB = ranlib
 
@@ -8,21 +8,25 @@ SRC_DIR = src
 INCLUDE_DIR = include
 BUILD_DIR = build
 
-SERVER_APP = repa          
-CLIENT_APP = repactl       
+SERVER_APP = repa
+CLIENT_APP = repactl
 
 ALL_SOURCES = $(wildcard $(SRC_DIR)/*.c)
 
+# Server: without repactl.c
 SERVER_SOURCES = $(filter-out $(SRC_DIR)/repactl.c, $(ALL_SOURCES))
+SERVER_OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SERVER_SOURCES))
 
-CLIENT_SOURCES = $(SRC_DIR)/repactl.c
+# Client: only repactl.c 
+CLIENT_SOURCES = $(wildcard $(SRC_DIR)/repactl.c)
+CLIENT_OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(CLIENT_SOURCES))
 
-SERVER_OBJECTS = $(SERVER_SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
-CLIENT_OBJECTS = $(CLIENT_SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+.PHONY: all clean repa repactl run-server run-client
 
-.PHONY: all clean test repa repactl
-
-all: repa repactl
+all: repa
+ifneq ($(CLIENT_SOURCES),)
+all: repactl
+endif
 
 repa: $(SERVER_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(SERVER_OBJECTS) $(LDFLAGS) -o $(BUILD_DIR)/$(SERVER_APP)
@@ -33,15 +37,16 @@ repactl: $(CLIENT_OBJECTS) | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+-include $(SERVER_OBJECTS:.o=.d)
+ifneq ($(CLIENT_OBJECTS),)
+-include $(CLIENT_OBJECTS:.o=.d)
+endif
+
 $(BUILD_DIR):
 	mkdir -p $@
 
-test: repa
-	$(CC) $(CFLAGS) -L$(BUILD_DIR) -I$(INCLUDE_DIR) tests/test.c -o tests/test $(LDFLAGS) -pthread
-	./tests/test
-
 clean:
-	rm -rf $(BUILD_DIR) tests/test
+	rm -rf $(BUILD_DIR)
 
 run-server: repa
 	./$(BUILD_DIR)/$(SERVER_APP)

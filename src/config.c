@@ -1,21 +1,33 @@
 #define _GNU_SOURCE
 
+#include "config.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
-#include <stdarg.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "config.h"
+#define MAX_KEY_LEN 128
+#define MAX_VALUE_LEN 512
+#define TO_BYTES (1024 * 1024)
+
+#define MAX_NUM_WORKERS 1024
+#define DEFAULT_PORT 6380
+#define DEFAULT_USER "admin"
+#define DEFAULT_PASSWORD "admin"
+#define DEFAULT_MAX_MEM_BYTES (256U * TO_BYTES)
+#define DEFAULT_TTL_SEC 0
+#define DEFAULT_NUM_WORKERS 4
+#define DEFAULT_LOG_LEVEL INFO
+#define DEFAULT_CONFIG_PATH "repa.conf"
+#define RADIX 10
+#define MAX_PORT 65535
 
 // Priority: CONFIG SET > CLI > файл > defaults
 
@@ -34,99 +46,71 @@ typedef struct {
 
 static repa_config config;
 
-static char *config_strdup(const char *str) {
-  size_t len;
-  char *copy;
-
-  if (!str) return NULL;
-  len = strlen(str) + 1;
-  copy = mmap(NULL, len, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (copy == MAP_FAILED) return NULL;
-  memcpy(copy, str, len);
-  return copy;
-}
-
-static void config_free_str(char *str) {
-  if (str) {
-    munmap(str, strlen(str) + 1);
-  }
-}
-
-static char *config_asprintf(const char *format, ...) {
-  va_list args;
-  va_start(args, format);
-  char *buf;
-  int len = vsnprintf(NULL, 0, format, args);
-  va_end(args);
-
-  if (len <= 0) return NULL;
-
-  buf = mmap(NULL, len + 1, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (buf == MAP_FAILED) return NULL;
-
-  va_start(args, format);
-  vsnprintf(buf, len + 1, format, args);
-  va_end(args);
-
-  return buf;
-}
-
 static void config_set_defaults(void) {
   config.port = DEFAULT_PORT;
-  config.default_user = config_strdup(DEFAULT_USER);
-  config.default_password = config_strdup(DEFAULT_PASSWORD);
+
+  config.default_user = strdup(DEFAULT_USER);
+  if (!config.default_user) 
+    return;
+
+  config.default_password = strdup(DEFAULT_PASSWORD);
+  if (!config.default_password) {
+    free(config.default_user);
+    config.default_user = NULL;
+    return;
+  }
+
   config.max_memory_size_bytes = DEFAULT_MAX_MEM_BYTES;
   config.default_ttl_sec = DEFAULT_TTL_SEC;
   config.num_workers = DEFAULT_NUM_WORKERS;
   config.log_level = DEFAULT_LOG_LEVEL;
   config.log_output = NULL;
+  config.is_init = false;
 }
 
-static bool parse_int(const char *str, int *out) {
-  if (!str) return false;
+static void parse_int(const char *str, int *out) {
+  if (!str || !out) return;
+
   char *end;
   errno = 0;
   long val = strtol(str, &end, RADIX);
-  if (errno || *end != '\0' || val < 0 || val > INT_MAX) return false;
+  if (errno || *end != '\0' || val < 0 || val > INT_MAX) return;
   *out = (int)val;
-  return true;
 }
 
-static bool parse_size_t(const char *str, size_t *out) {
-  if (!str) return false;
+static void parse_size_t(const char *str, size_t *out) {
+  if (!str || !out) return;
   char *end;
   errno = 0;
   unsigned long long val = strtoull(str, &end, RADIX);
-  if (errno || *end != '\0') return false;
+  if (errno || *end != '\0') return;
   *out = (size_t)val;
-  return true;
 }
 
-static bool handle_port(const char *value) {
-  return parse_int(value, &config.port);
+static void handle_port(const char *value) {
+  parse_int(value, &config.port);
 }
 
-static bool handle_max_memory_mb(const char *value) {
+static void handle_max_memory_mb(const char *value) {
   size_t mb;
-  if (!parse_size_t(value, &mb)) return false;
+  parse_size_t(value, &mb);
+  if(mb == 0 || mb > (SIZE_MAX / TO_BYTES)) {
+    return;
+  }
+
   config.max_memory_size_bytes = mb * TO_BYTES;
-  return true;
 }
 
-static bool handle_workers(const char *value) {
-  return parse_int(value, &config.num_workers);
+static void handle_workers(const char *value) {
+  parse_int(value, &config.num_workers);
 }
 
-static bool handle_default_ttl(const char *value) {
-  return parse_int(value, &config.default_ttl_sec);
+static void handle_default_ttl(const char *value) {
+  parse_int(value, &config.default_ttl_sec);
 }
 
-static bool handle_verbose(const char *value) {
-  (void)value;
+static void handle_verbose(void) {
   config.log_level = DEBUG;
-  return true;
 }
 
 static void print_help_and_exit() {
@@ -144,16 +128,14 @@ static void print_help_and_exit() {
   exit(0);
 }
 
-static bool handle_help(const char *value) {
-  (void)value;
+static void handle_help(void) {
   print_help_and_exit();
-  return true;
 }
 
 static const char *get_config_path_from_cli(const int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-      return argv[++i];
+      return argv[i + 1];
     }
   }
   return DEFAULT_CONFIG_PATH;
@@ -162,56 +144,59 @@ static const char *get_config_path_from_cli(const int argc, char *argv[]) {
 static void apply_cli_flags(const int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-      handle_port(argv[++i]);
+      handle_port(argv[i + 1]);
+      i++; 
     } else if (strcmp(argv[i], "--max-memory-mb") == 0 && i + 1 < argc) {
-      handle_max_memory_mb(argv[++i]);
+      handle_max_memory_mb(argv[i + 1]);
+      i++;
     } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
-      handle_workers(argv[++i]);
+      handle_workers(argv[i + 1]);
+      i++;
     } else if (strcmp(argv[i], "--default-ttl") == 0 && i + 1 < argc) {
-      handle_default_ttl(argv[++i]);
+      handle_default_ttl(argv[i + 1]);
+      i++;
     } else if (strcmp(argv[i], "--verbose") == 0) {
-      handle_verbose(NULL);
+      handle_verbose();
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "--h") == 0) {
-      handle_help(NULL);
-    }
+      handle_help();
+    } 
   }
 }
 
 static bool config_load_file(const char *path) {
-  int fd;
+  int fd = -1;
   struct stat sb;
   size_t file_size;
-  char *data;
-  char *start;
-  char *end;
+  char *data = NULL;
+  bool success = false;
 
   fd = open(path, O_RDONLY);
   if (fd == -1) {
-    if (errno != ENOENT) {
-      logger_error("Failed to open config file: %s", path);
-    }
     return false;
   }
 
   if (fstat(fd, &sb) == -1) {
-    close(fd);
-    return false;
+    goto CLEANUP;
   }
 
   if (sb.st_size == 0) {
-    close(fd);
-    return true;
+    success = true;
+    goto CLEANUP;
   }
 
   file_size = (size_t)sb.st_size;
-  data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (data == MAP_FAILED) {
-    close(fd);
-    return false;
+  data = malloc(file_size);
+  if (!data) {
+    goto CLEANUP;
   }
 
-  start = data;
-  end = data + file_size;
+  ssize_t bytes_read = read(fd, data, file_size);
+  if (bytes_read != (ssize_t)file_size) {
+    goto CLEANUP;
+  }
+
+  char *start = data;
+  char *end = data + file_size;
 
   while (start < end) {
     char *end_of_line = memchr(start, '\n', end - start);
@@ -259,49 +244,80 @@ static bool config_load_file(const char *path) {
     if (val_len > 0) memcpy(value, val_start, val_len);
 
     if (strcmp(key, "port") == 0) {
-      int port;
-      if (parse_int(value, &port)) config.port = port;
+      int port = 0;
+      parse_int(value, &port);
+      if (port > 0 && port <= MAX_PORT) {
+        config.port = port;
+      }
     } else if (strcmp(key, "default_user") == 0) {
-      config_free_str(config.default_user);
-      config.default_user = config_strdup(value);
+      char *new_user = strdup(value);
+      if (!new_user) {
+        goto CLEANUP;
+      }
+      free(config.default_user);
+      config.default_user = new_user;
     } else if (strcmp(key, "default_password") == 0) {
-      config_free_str(config.default_password);
-      config.default_password = config_strdup(value);
+      char *new_password = strdup(value);
+      if (!new_password) {
+        goto CLEANUP;
+      }
+      free(config.default_password);
+      config.default_password = new_password;
     } else if (strcmp(key, "max_memory_mb") == 0) {
-      size_t mb;
-      if (parse_size_t(value, &mb)) {
+      size_t mb = 0;
+      parse_size_t(value, &mb);
+      if (mb > 0 && mb <= (SIZE_MAX / TO_BYTES)) {
         config.max_memory_size_bytes = mb * TO_BYTES;
       }
     } else if (strcmp(key, "default_ttl") == 0) {
-      int ttl;
-      if (parse_int(value, &ttl)) config.default_ttl_sec = ttl;
+      int ttl = 0;
+      parse_int(value, &ttl);
+      if (ttl >= 0) {
+        config.default_ttl_sec = ttl;
+      }
     } else if (strcmp(key, "workers") == 0) {
       int workers;
-      if (parse_int(value, &workers)) config.num_workers = workers;
+      parse_int(value, &workers);
+      if (workers > 0 && workers <= MAX_NUM_WORKERS) {
+        config.num_workers = workers;
+      }
     } else if (strcmp(key, "log_level") == 0) {
       config.log_level = logger_level_from_string(value);
     } else if (strcmp(key, "log_output") == 0) {
-      config_free_str(config.log_output);
-      config.log_output = config_strdup(value);
-    }
+      char *new_log_output = strdup(value);
+      if (!new_log_output) {
+        goto CLEANUP;
+      }
+      free(config.log_output);
+      config.log_output = new_log_output;
+    } 
 
     start = end_of_line + 1;
   }
 
-  munmap(data, file_size);
-  close(fd);
-  return true;
+  success = true;
+
+CLEANUP:
+  if (data) free(data);
+  if (fd != -1) close(fd);
+  return success;
 }
 
 void config_init(const int argc, char *argv[]) {
   if (pthread_mutex_init(&config.mutex, NULL) != 0) {
-    logger_error("Failed to initialize config mutex");
     exit(1);
   }
 
   pthread_mutex_lock(&config.mutex);
   if (!config.is_init) {
     config_set_defaults();
+
+    if (!config.default_user || !config.default_password) {
+      pthread_mutex_unlock(&config.mutex);
+      pthread_mutex_destroy(&config.mutex);
+      exit(1);
+    }
+
     const char *config_path = get_config_path_from_cli(argc, argv);
     config_load_file(config_path);
     apply_cli_flags(argc, argv);
@@ -311,12 +327,15 @@ void config_init(const int argc, char *argv[]) {
   pthread_mutex_unlock(&config.mutex);
 }
 
-void config_destroy() {
+void config_destroy(void) {
   pthread_mutex_lock(&config.mutex);
   if (config.is_init) {
-    config_free_str(config.default_user);
-    config_free_str(config.default_password);
-    config_free_str(config.log_output);
+    free(config.default_user);
+    free(config.default_password);
+    free(config.log_output);
+    config.default_user = NULL;
+    config.default_password = NULL;
+    config.log_output = NULL;
     config.is_init = false;
   }
   pthread_mutex_unlock(&config.mutex);
@@ -324,7 +343,7 @@ void config_destroy() {
 }
 
 bool config_set(const char *param, const char *value) {
-  bool result;
+  bool result = false;
   if (!param || !value) return false;
 
   pthread_mutex_lock(&config.mutex);
@@ -336,8 +355,9 @@ bool config_set(const char *param, const char *value) {
   result = false;
 
   if (strcasecmp(param, "maxmemory") == 0) {
-    size_t bytes;
-    if (parse_size_t(value, &bytes)) {
+    size_t bytes = 0;
+    parse_size_t(value, &bytes);
+    if (bytes > 0) {
       config.max_memory_size_bytes = bytes;
       result = true;
     }
@@ -345,9 +365,12 @@ bool config_set(const char *param, const char *value) {
     config.log_level = logger_level_from_string(value);
     result = true;
   } else if (strcasecmp(param, "requirepass") == 0) {
-    config_free_str(config.default_password);
-    config.default_password = config_strdup(value);
-    result = true;
+    char *new_pass = strdup(value);
+    if (new_pass) {
+      free(config.default_password);
+      config.default_password = new_pass;
+      result = true;
+    }
   }
 
   pthread_mutex_unlock(&config.mutex);
@@ -355,12 +378,12 @@ bool config_set(const char *param, const char *value) {
 }
 
 // Getters
-int config_get_port() { 
-  return config.port; 
+int config_get_port(void) {
+  return config.port;
 }
 
 char *config_get_param(const char *param) {
-  char *result;
+  char *result = NULL;
   if (!param)
     return NULL;
 
@@ -371,61 +394,68 @@ char *config_get_param(const char *param) {
     return NULL;
   }
 
-  result = NULL;
   if (strcasecmp(param, "maxmemory") == 0) {
-    result = config_asprintf("%zu", config.max_memory_size_bytes);
+    if (asprintf(&result, "%zu", config.max_memory_size_bytes) == -1) {
+      result = NULL; 
+    }
   } else if (strcasecmp(param, "loglevel") == 0) {
     if (config.log_level == DEBUG) {
-      result = config_strdup("debug");
+      result = strdup("debug");
     } else if (config.log_level == WARNING) {
-      result = config_strdup("warning");
+      result = strdup("warning");
     } else if (config.log_level == ERROR) {
-      result = config_strdup("error");
+      result = strdup("error");
     } else {
-      result = config_strdup("notice");  // Redis default for INFO
+      result = strdup("notice");  // Redis default for INFO
     }
   } else if (strcasecmp(param, "requirepass") == 0) {
     if (config.default_password) {
-      result = config_strdup(config.default_password);
+      result = strdup(config.default_password);
     } else {
-      result = config_strdup("");
+      result = strdup("");
     }
   } else if (strcasecmp(param, "port") == 0) {
-    result = config_asprintf("%d", config.port);
+    if (asprintf(&result, "%d", config.port) == -1) {
+      result = NULL;
+    }
   } else if (strcasecmp(param, "maxmemory-policy") == 0) {
-    result = config_strdup("noeviction");
+    result = strdup("noeviction");
   } else if (strcasecmp(param, "tcp-keepalive") == 0) {
-    result = config_strdup("0");
+    result = strdup("0");
+  } else if (strcasecmp(param, "save") == 0) {
+    result = strdup("");  
+  } else if (strcasecmp(param, "appendonly") == 0) {
+    result = strdup("no"); 
   }
 
   pthread_mutex_unlock(&config.mutex);
   return result;
 }
 
-size_t config_get_max_memory_bytes() { 
-  return config.max_memory_size_bytes; 
+size_t config_get_max_memory_bytes(void) {
+  return config.max_memory_size_bytes;
 }
 
-int config_get_default_ttl_sec() { 
+int config_get_default_ttl_sec(void) { 
   return config.default_ttl_sec; 
 }
 
-int config_get_workers() { 
+int config_get_workers(void) { 
   return config.num_workers; 
 }
 
-logger_level config_get_log_level() { 
+logger_level config_get_log_level(void) { 
   return config.log_level; 
 }
 
-char *config_get_log_output() { 
+char *config_get_log_output(void) { 
   return config.log_output; 
 }
 
-char *config_get_default_user() { 
+char *config_get_default_user(void) { 
   return config.default_user; 
 }
 
-char *config_get_default_password() { 
+char *config_get_default_password(void) { 
   return config.default_password; 
 }
