@@ -17,10 +17,16 @@
 #define LOAD_FACTOR 0.75
 #define UNUSED(x) (void)(x)
 
-// Вытеснение по TTL:
-//   - ленивое: при GET/TTL — удаляется просроченный ключ при обращении к нему
-//   - фоновое: отдельный GC-поток каждую секунду удаляет все просроченные ключи
-// Вытеснение по памяти (LRU): синхронное при нехватке памяти в storage_set
+// The storage uses two data structures in tandem:
+// 1. A hash table (buckets array) for efficient key lookup.
+// 2. A doubly-linked list (lru_list)  for efficient LRU (Least Recently Used)
+// eviction when memory is full.
+// They provide O(1) average-time lookup and O(1) LRU update/eviction
+
+// Expiration (TTL):
+// 1. Lazy cleanup: expired keys are removed on GET/TTL access.
+// 2. Background GC: a dedicated thread removes all expired keys every second.
+// Memory eviction (LRU): synchronously in storage_set when memory limit is reached.
 
 typedef struct kv_node {
   char *key;
@@ -223,7 +229,6 @@ static void storage_stop_gc(void) {
 
   gc_running = false;
   pthread_join(gc_thread, NULL);
-  logger_info("GC thread stopped");
 }
 
 bool storage_init(const size_t max_memory_bytes) {

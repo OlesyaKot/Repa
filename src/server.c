@@ -2,6 +2,7 @@
 
 #include "server.h"
 
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -401,16 +402,11 @@ CLEANUP:
   free(cmd_upper);
 }
 
-static void worker_cleanup_handler(void *arg) {
-  UNUSED(arg);
-  pthread_testcancel();
-}
 
 static void *worker_thread_func(void *args) {
   size_t worker_id = (size_t)args;
   logger_info("Worker %zu started", worker_id);
 
-  pthread_cleanup_push(worker_cleanup_handler, NULL);
   pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
   pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 
@@ -418,8 +414,7 @@ static void *worker_thread_func(void *args) {
     pthread_testcancel();
 
     client_session *session = (client_session *)job_queue_pop();
-    if (!session)
-      continue;
+    if (!session) continue;
 
     pthread_mutex_lock(&server.sessions_mutex);
     list_node *node = list_find(server.sessions_list, find_session_by_ptr, session);
@@ -441,7 +436,6 @@ static void *worker_thread_func(void *args) {
       continue;
     }
 
-    // Read data
     char read_buf[BUFFER_SIZE];
     ssize_t bytes_read = read(session->fd, read_buf, sizeof(read_buf));
     bool should_close = false;
@@ -457,10 +451,8 @@ static void *worker_thread_func(void *args) {
         size_t total_consumed = 0;
         while (server.running && !should_close && session->input_len > 0) {
           size_t consumed = 0;
-          resp_list_commands *cmds =
-              resp_parse(session->input_buffer + total_consumed,
-                         session->input_len - total_consumed, &consumed);
-
+          resp_list_commands *cmds = resp_parse(session->input_buffer + total_consumed, 
+                                  session->input_len - total_consumed, &consumed);
           if (cmds) {
             for (size_t j = 0; j < cmds->num_commands; j++) {
               handle_command(session, &cmds->commands[j]);
@@ -472,7 +464,7 @@ static void *worker_thread_func(void *args) {
             resp_free_command_list(cmds);
             total_consumed += consumed;
           } else {
-           if (consumed == 0 && session->input_len >= MAX_INPUT_BUFFER_SIZE) {
+            if (consumed == 0 && session->input_len >= MAX_INPUT_BUFFER_SIZE) {
               logger_error("Invalid RESP data, closing connection");
               should_close = true;
             }
@@ -491,7 +483,7 @@ static void *worker_thread_func(void *args) {
     } else if (bytes_read == 0) {
       logger_info("Client closed connection (fd %d)", session->fd);
       should_close = true;
-    } else if (bytes_read < 0) {
+    } else {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         logger_error("Read error on fd %d: %s", session->fd, strerror(errno));
         should_close = true;
@@ -521,84 +513,75 @@ static void *worker_thread_func(void *args) {
     session_release(session);
   }
 
-  pthread_cleanup_pop(1);
   logger_info("Worker %zu stopped", worker_id);
   return NULL;
 }
-  
+
 static void *accept_thread_func(void *args) {
   UNUSED(args);
   logger_info("Accept thread started");
 
-  fd_set read_fds;
-  struct timeval timeout;
-
   while (server.running) {
-    FD_ZERO(&read_fds);
-    int max_fd = -1;
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
     pthread_mutex_lock(&server.listen_mutex);
-    if (server.listen_fd >= 0) {
-      FD_SET(server.listen_fd, &read_fds);
-      max_fd = server.listen_fd;
-    }
-    pthread_mutex_unlock(&server.listen_mutex);
-
-    if (max_fd < 0) break;
-
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-    if (ready < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EBADF) break;
-      logger_error("Select error: %s", strerror(errno));
+    if (server.listen_fd < 0) {
+      pthread_mutex_unlock(&server.listen_mutex);
       break;
     }
+    int client_fd = accept(server.listen_fd, (struct sockaddr *)&client_addr, &client_len);
+    pthread_mutex_unlock(&server.listen_mutex);
 
-    if (ready == 0) continue; 
+    if (client_fd >= 0) {
+      // Make client socket non-blocking because read() is a blocking system
+      // call. Otherwise, a worker thread would block indefinitely in read() if
+      // the client (repactl) stays connected but sends no data, preventing graceful shutdown.      
+      int flags = fcntl(client_fd, F_GETFL, 0);
+      if (flags == -1 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        logger_warn("Failed to set client fd %d to non-blocking", client_fd);
+      }
 
-    pthread_mutex_lock(&server.listen_mutex);
-    if (server.listen_fd >= 0 && FD_ISSET(server.listen_fd, &read_fds)) {
-      struct sockaddr_in client_addr;
-      socklen_t client_len = sizeof(client_addr);
-      int client_fd = accept(server.listen_fd, (struct sockaddr *)&client_addr, &client_len);
+      client_session *session = malloc(sizeof(client_session));
+      if (!session) {
+        close(client_fd);
+        continue;
+      }
 
-      if (client_fd >= 0 && client_fd != server.listen_fd) {
-        client_session *session = malloc(sizeof(client_session));
-        if (session) {
-          session->fd = client_fd;
-          session->is_auth = false;
-          session->input_buffer = NULL;
-          session->input_len = 0;
-          session->input_capacity = 0;
-          session->output_buffer = NULL;
-          session->output_len = 0;
-          session->output_capacity = 0;
-          session->should_close = false;
-          session->ref_count = 1;
-          pthread_mutex_init(&session->mutex, NULL);
+      session->fd = client_fd;
+      session->is_auth = false;
+      session->input_buffer = NULL;
+      session->input_len = 0;
+      session->input_capacity = 0;
+      session->output_buffer = NULL;
+      session->output_len = 0;
+      session->output_capacity = 0;
+      session->should_close = false;
+      session->ref_count = 1;
+      pthread_mutex_init(&session->mutex, NULL);
 
-          pthread_mutex_lock(&server.sessions_mutex);
-          if (list_push_front(server.sessions_list, session)) {
-            server.sessions_count++;
-            pthread_mutex_unlock(&server.sessions_mutex);
-            stats_inc_connection();
-            logger_info("Client connected from %s:%d", inet_ntoa(client_addr.sin_addr),
-                          ntohs(client_addr.sin_port));
-            job_queue_push(session);
-          } else {
-            pthread_mutex_unlock(&server.sessions_mutex);
-            close(client_fd);
-            session_release(session);
-          }
-        } else {
-          close(client_fd);
-        }
+      pthread_mutex_lock(&server.sessions_mutex);
+      if (list_push_front(server.sessions_list, session)) {
+        server.sessions_count++;
+        pthread_mutex_unlock(&server.sessions_mutex);
+        stats_inc_connection();
+        logger_info("Client connected from %s:%d", inet_ntoa(client_addr.sin_addr),
+                    ntohs(client_addr.sin_port));
+        job_queue_push(session);
+      } else {
+        pthread_mutex_unlock(&server.sessions_mutex);
+        close(client_fd);
+        session_release(session);
+      }
+    } else {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      } else if (errno == EINTR) {
+        continue;
+      } else {
+        logger_error("Accept error: %s", strerror(errno));
+        break;
       }
     }
-    pthread_mutex_unlock(&server.listen_mutex);
   }
 
   logger_info("Accept thread stopped");
@@ -611,6 +594,16 @@ bool server_start(const int port, const size_t worker_count) {
   server.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server.listen_fd < 0) {
     logger_error("Failed to create socket");
+    return false;
+  }
+
+  // Make listen socket non-blocking because accept() is a blocking system call.
+  // Otherwise, the accept thread would block indefinitely in accept() when no
+  // clients are connecting, preventing it from exiting during graceful shutdown.
+  int flags = fcntl(server.listen_fd, F_GETFL, 0); 
+  if (flags == -1 || fcntl(server.listen_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    logger_error("Failed to set listen_fd to non-blocking");
+    close(server.listen_fd);
     return false;
   }
 
