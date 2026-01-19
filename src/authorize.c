@@ -8,6 +8,7 @@
 #include <strings.h>
 
 #include "config.h"
+#include "logger.h"
 
 typedef struct {
   char* user;
@@ -47,7 +48,7 @@ void authorize_init(void) {
   }
   server_auth.is_initialized = true;
 
-  logger_info("Authorization initialized: user='%s", user);
+  logger_info("Authorization initialized: user='%s'", user);
 
   pthread_rwlock_unlock(&server_auth.lock);
 }

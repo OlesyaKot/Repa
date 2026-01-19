@@ -6,45 +6,30 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "logger.h"
-
 #define MAX_COMMAND_ARGS 64
 #define MAX_COMMAND_LEN 1024 * 1024  // 1MB
 #define INIT_CAP 4
 #define TOTAL_LEN_NIL 7   // "$-1\r\n\0"
 #define TOTAL_LEN_INT 32  // for int64 + \r\n\0
+#define RADIX 10
 
 static bool parse_integer(const char *str, const size_t len, int64_t *out) {
   if (len == 0) return false;
-  const char *end = str + len;
-  const char *ptr = str;
-  int sign = 1;
-  int64_t value = 0;
 
-  if (*ptr == '-') {
-    sign = -1;
-    ptr++;
-    if (ptr >= end) return false;
-  } else if (*ptr == '+') {
-    ptr++;
-    if (ptr >= end) return false;
-  }
+  char *buf = malloc(len + 1);
+  if (!buf) 
+    return false;
 
-  if (ptr == end) return false;
+  memcpy(buf, str, len);
+  buf[len] = '\0';
 
-  while (ptr < end) {
-    if (!isdigit((unsigned char)*ptr)) return false;
-    if (value > (INT64_MAX / 10)) return false;
-    value *= 10;
+  char *endptr;
+  errno = 0;
+  *out = strtoll(buf, &endptr, RADIX);
 
-    int digit = (*ptr - '0');
-    if (value > (INT64_MAX - digit)) return false;
-    value += digit;
-    ptr++;
-  }
-
-  *out = sign * value;
-  return true;
+  bool success = (errno == 0) && (endptr == buf + len);
+  free(buf);
+  return success;
 }
 
 static char *parse_bulk_string(const char **start_ptr, const char *end_ptr, size_t *out_len, bool *is_nil) {
@@ -240,7 +225,9 @@ static bool parse_simple_line(const char **start_ptr, const char *end_ptr, resp_
     cmd->args_lens = malloc(sizeof(size_t) * cmd->args_num);
     if (!cmd->args_lens) {
       free(cmd->args);
-      for (int i = 0; i < argc; i++) free(argv[i]);
+      for (int i = 0; i < argc; i++) {
+        free(argv[i]);
+      }
       free(line_copy);
       return false;
     }
@@ -311,10 +298,8 @@ resp_list_commands *resp_parse(const char *buffer, const size_t len, size_t *con
   const char *end_ptr = buffer + len;
   size_t commands_parsed = 0;
   size_t capacity = INIT_CAP;
-  resp_command *commands = malloc(sizeof(resp_command) * INIT_CAP);
+  resp_command *commands = calloc(INIT_CAP, sizeof(resp_command));
   if (!commands) return NULL;
-
-  memset(commands, 0, sizeof(resp_command) * capacity);
 
   while (start_ptr < end_ptr) {
     if (commands_parsed == 0) {
@@ -438,7 +423,7 @@ char *resp_serialize_bulk_string(const char *data, const size_t len) {
   }
 
   size_t num_len = 1;
-  for (size_t n = len; n >= 10; n /= 10) {
+  for (size_t n = len; n >= RADIX; n /= RADIX) {
     num_len++;
   }
 

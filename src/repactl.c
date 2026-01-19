@@ -1,13 +1,16 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <termios.h>
+#include <unistd.h>
 
 #define DEFAULT_IP_ADDR "127.0.0.1"
 #define DEFAULT_PORT 6380
@@ -299,9 +302,19 @@ int main(int argc, char *argv[]) {
 
   if (username) {
     auth_user = strdup(username);
+    if (!auth_user) {
+      fprintf(stderr, "Out of memory\n");
+      close(sockfd);
+      return 1;
+    }
   } else {
     if (command_start != -1) {
       auth_user = strdup("admin");
+      if (!auth_user) {
+        fprintf(stderr, "Out of memory\n");
+        close(sockfd);
+        return 1;
+      }
     } else {
       auth_user = readline("Username: ");
       if (!auth_user || !*auth_user) {
@@ -313,7 +326,13 @@ int main(int argc, char *argv[]) {
   }
 
   if (command_start != -1) {
-    auth_pass = strdup("admin");  
+    auth_pass = strdup("admin");
+        if (!auth_pass) {
+        fprintf(stderr, "Out of memory\n");
+        free(auth_user);
+        close(sockfd);
+        return 1;
+    }  
   } else {
     auth_pass = get_password_secure();
     if (!auth_pass) {

@@ -399,20 +399,25 @@ char *config_get_param(const char *param) {
       result = NULL; 
     }
   } else if (strcasecmp(param, "loglevel") == 0) {
+    const char *tmp = NULL;
     if (config.log_level == DEBUG) {
-      result = strdup("debug");
+      tmp = "debug";
     } else if (config.log_level == WARNING) {
-      result = strdup("warning");
+      tmp = "warning";
     } else if (config.log_level == ERROR) {
-      result = strdup("error");
+      tmp = "error";
     } else {
-      result = strdup("notice");  // Redis default for INFO
+      tmp = "notice";  // Redis default for INFO
+    }
+    result = strdup(tmp);
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for loglevel");
     }
   } else if (strcasecmp(param, "requirepass") == 0) {
-    if (config.default_password) {
-      result = strdup(config.default_password);
-    } else {
-      result = strdup("");
+    const char *tmp = config.default_password ? config.default_password : "";
+    result = strdup(tmp);
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for requirepass");
     }
   } else if (strcasecmp(param, "port") == 0) {
     if (asprintf(&result, "%d", config.port) == -1) {
@@ -420,12 +425,24 @@ char *config_get_param(const char *param) {
     }
   } else if (strcasecmp(param, "maxmemory-policy") == 0) {
     result = strdup("noeviction");
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for maxmemory-policy");
+    }
   } else if (strcasecmp(param, "tcp-keepalive") == 0) {
     result = strdup("0");
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for tcp-keepalive");
+    }
   } else if (strcasecmp(param, "save") == 0) {
-    result = strdup("");  
+    result = strdup("");
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for save");
+    }
   } else if (strcasecmp(param, "appendonly") == 0) {
-    result = strdup("no"); 
+    result = strdup("no");
+    if (!result) {
+      logger_error("config_get_param: failed to allocate memory for appendonly");
+    }
   }
 
   pthread_mutex_unlock(&config.mutex);

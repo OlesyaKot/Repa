@@ -2,21 +2,22 @@
 
 #include "server.h"
 
-#include <fcntl.h>
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "authorize.h"
 #include "config.h"
 #include "list.h"
 #include "logger.h"
-#include "queue.h"      // for sessions
+#include "queue.h"  // for sessions
 #include "resp_command_parser.h"
 #include "statistics.h"
 #include "storage.h"
