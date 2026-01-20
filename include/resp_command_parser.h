@@ -19,10 +19,8 @@ typedef struct {
 
 resp_list_commands *resp_parse(const char *buffer, const size_t len, size_t *consumed);
 void resp_free_command_list(resp_list_commands *list);
-
 char *resp_serialize_simple_string(const char *str);
 char *resp_serialize_error(const char *msg);
-char *resp_serialize_simple_string(const char *str);
 char *resp_serialize_bulk_string(const char *data, const size_t len);
 char *resp_serialize_nil(void);
 char *resp_serialize_integer(int64_t num);

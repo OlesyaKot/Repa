@@ -38,12 +38,14 @@ void authorize_init(void) {
   server_auth.user = strdup(user);
   if (!server_auth.user) {
     pthread_rwlock_unlock(&server_auth.lock);
+    pthread_rwlock_destroy(&server_auth.lock);
     return;
   }
   server_auth.password = strdup(password);
   if (!server_auth.password) {
     free(server_auth.user);
     pthread_rwlock_unlock(&server_auth.lock);
+    pthread_rwlock_destroy(&server_auth.lock);
     return;
   }
   server_auth.is_initialized = true;
