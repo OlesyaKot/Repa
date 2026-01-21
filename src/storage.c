@@ -253,7 +253,7 @@ bool storage_init(const size_t max_memory_bytes) {
     return false;
   }
 
-  store.buckets = calloc(sizeof(kv_node *), store.capacity);
+  store.buckets = calloc(store.capacity, sizeof(kv_node *));
   if (!store.buckets) {
     logger_error("Hash create failed");
     list_destroy(store.lru_list, NULL);

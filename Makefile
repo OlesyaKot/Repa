@@ -1,5 +1,5 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -g -pthread -I$(INCLUDE_DIR) -MMD -MP
+CC = gcc-13
+CFLAGS = -Wall -Wextra -Werror -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -g -pthread -I$(INCLUDE_DIR) -MMD -MP
 LDFLAGS = -fsanitize=address,undefined -pthread
 AR = ar
 RANLIB = ranlib
