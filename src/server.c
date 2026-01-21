@@ -24,7 +24,7 @@
 
 #define MAX_PORT 65535
 #define QUEUE_LEN 128
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE (4 * 1024)
 #define INPUT_BUFFER_INITIAL_SIZE (4 * 1024)
 #define MAX_INPUT_BUFFER_SIZE (8 * 1024 * 1024)
 #define ERROR_BUF_LEN 256
@@ -608,8 +608,7 @@ bool server_start(const int port, const size_t worker_count) {
     return false;
   }
 
-  int reuse = 1;
-  setsockopt(server.listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  setsockopt(server.listen_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
 
   struct sockaddr_in server_addr = {0};
   server_addr.sin_family = AF_INET;
